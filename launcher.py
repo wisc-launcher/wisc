@@ -16,6 +16,13 @@ import requests
 import minecraft_launcher_lib
 import ely_auth
 from mod_services import ModManager
+from performance_mode import (
+	apply_performance_options,
+	performance_jvm_args,
+	install_performance_mod,
+	remove_performance_mod,
+	performance_agent_argument,
+)
 from storage import (
 	load_pending_installations,
 	save_pending_installations,
@@ -964,6 +971,16 @@ async def start_game(
 	if not target.get("is_instance"):
 		game_folder.mkdir(parents=True, exist_ok=True)
 
+	performance_mode = bool((settings or {}).get("performance_mode", False))
+	loader_name = str(target.get("loader", "Vanilla")).casefold()
+	if performance_mode:
+		callback["setStatus"]("Applying 1K FPS settings...")
+		apply_performance_options(game_folder)
+		if loader_name in ("fabric", "quilt"):
+			install_performance_mod(game_folder)
+	else:
+		remove_performance_mod(game_folder)
+
 	active_account = await asyncio.to_thread(get_active_account, include_credentials=online_available)
 	account_type = active_account.get("type", "offline")
 	account_username = str(active_account.get("username", username)).strip() or username or "Player"
@@ -1020,6 +1037,7 @@ async def start_game(
 		if online_available and not active_token:
 			callback["setStatus"]("Ely.by session unavailable; playing offline. Sign in again for multiplayer.")
 
+	ram_mb = int((settings or {}).get("ram_mb", 4096))
 	launch_options = {
 		"username": account_username,
 		"uuid": active_uuid,
@@ -1035,10 +1053,17 @@ async def start_game(
 			int((settings or {}).get("window_height", 480))
 		),
 		"jvmArguments": [
-			f"-Xms256M",
-			f"-Xmx{int((settings or {}).get('ram_mb', 4096))}M",
+			f"-Xms{ram_mb if performance_mode else 256}M",
+			f"-Xmx{ram_mb}M",
 		],
 	}
+	if performance_mode:
+		launch_options["jvmArguments"].extend(performance_jvm_args())
+		# The agent entrypoint applies the same preset on Vanilla, Forge,
+		# NeoForge, and OptiFine profiles where the Fabric mod cannot load.
+		agent_argument = performance_agent_argument(game_folder)
+		if agent_argument:
+			launch_options["jvmArguments"].append(agent_argument)
 
 	# Skin system is ONLY active for Ely.by accounts.
 	# Offline mode strictly disables custom skins and skin bridge (defaults to vanilla Steve/Alex).
