@@ -233,17 +233,20 @@ class CurseForgeClient(ModrinthClient):
         return {"hits": [self._project(item) for item in result["data"]],
                 "total_hits": result.get("pagination", {}).get("totalCount", len(result["data"]))}
 
-    def project(self, project_id: str) -> dict:
+    def _project_details(self, project_id: str, content_type: str) -> dict:
         number = self._project_number(project_id)
         data = self._request(f"/mods/{number}")["data"]
         if curseforge_project_id(data["id"]) != project_id:
             raise ValueError("CurseForge returned a different project.")
-        result = self._project(data)
+        result = self._project(data, content_type=content_type)
         try:
             result["body"] = self._request(f"/mods/{number}/description")["data"]
         except ConnectionError:
             result["body"] = result["description"]
         return result
+
+    def project(self, project_id: str) -> dict:
+        return self._project_details(project_id, "mod")
 
     def project_members(self, project_id: str) -> list[dict]:
         number = self._project_number(project_id)
@@ -333,17 +336,14 @@ class CurseForgeClient(ModrinthClient):
             raise ValueError("CurseForge returned too many content versions.")
         return sorted(versions, key=lambda version: version["date_published"], reverse=True)
 
+    def content_project(self, project_id: str, kind: str) -> dict:
+        """Fetch a shader or resource pack description with its gallery."""
+        if kind not in {"shader", "resourcepack"}:
+            raise ValueError("Choose shaders or texture packs.")
+        return self._project_details(project_id, kind)
+
     def modpack_project(self, project_id: str) -> dict:
-        number = self._project_number(project_id)
-        data = self._request(f"/mods/{number}")["data"]
-        if curseforge_project_id(data["id"]) != project_id:
-            raise ValueError("CurseForge returned a different modpack.")
-        result = self._project(data, content_type="modpack")
-        try:
-            result["body"] = self._request(f"/mods/{number}/description")["data"]
-        except ConnectionError:
-            result["body"] = result["description"]
-        return result
+        return self._project_details(project_id, "modpack")
 
     def modpack_versions(self, project_id: str) -> list[dict]:
         number = self._project_number(project_id)

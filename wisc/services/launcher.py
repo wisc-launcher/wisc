@@ -1041,14 +1041,14 @@ async def start_game(
 		],
 	}
 
-	# Skin system is ONLY active for Ely.by accounts.
-	# Offline mode strictly disables custom skins and skin bridge (defaults to vanilla Steve/Alex).
-	if account_type == "ely" and (settings or {}).get("enable_custom_skins", True):
+	if account_type in {"ely", "offline"} and (settings or {}).get("enable_custom_skins", True):
 		active_uuid, skin_jvm_args, skin_server_instance = prepare_skin_launch(
 			username=account_username,
 			game_dir=game_dir,
 			minecraft_dir=minecraft_directory,
 			is_online=online_available,
+			local_only=account_type == "offline",
+			account_id=str(active_account.get("id", "")),
 		)
 		launch_options["jvmArguments"].extend(skin_jvm_args)
 		launch_options["uuid"] = active_uuid
@@ -1121,7 +1121,7 @@ async def start_game(
 		}
 		process.wisc_presence_face = None
 		cached_skin_bytes = getattr(skin_server_instance, "cached_bytes", None)
-		if cached_skin_bytes and (settings or {}).get("discord_rpc", True):
+		if account_type != "offline" and cached_skin_bytes and (settings or {}).get("discord_rpc", True):
 			try:
 				process.wisc_presence_face = render_head_avatar_bytes(cached_skin_bytes, scale=1)
 			except (OSError, ValueError):

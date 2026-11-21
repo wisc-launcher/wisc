@@ -15,6 +15,9 @@ public class SkinBridgeHook {
     public static volatile String activeUser = "";
     public static volatile String activeModel = "classic";
     public static volatile String activeHash = "";
+    public static volatile String activeCapeHash = "";
+    public static volatile String activeUuid = "";
+    public static volatile boolean localOnly = false;
 
     private static final Set<String> loggedPlayers = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
     private static volatile ReflectionCache cachedReflect = null;
@@ -80,13 +83,16 @@ public class SkinBridgeHook {
             return propCtor2.newInstance(name, value);
         }
 
-        Object createPropertyMap(Object originalMap, Object prop) throws Exception {
+        Object createPropertyMap(Object originalMap, Object prop, boolean replaceTextures) throws Exception {
             if (mapNoArgCtor != null) {
                 Object newMap = mapNoArgCtor.newInstance();
                 if (originalMap != null && putAll != null) {
                     try {
                         putAll.invoke(newMap, originalMap);
                     } catch (Exception ignored) {}
+                }
+                if (replaceTextures) {
+                    multimapInterface.getMethod("removeAll", Object.class).invoke(newMap, "textures");
                 }
                 if (putMethod != null) {
                     putMethod.invoke(newMap, "textures", prop);
@@ -98,6 +104,9 @@ public class SkinBridgeHook {
                     try {
                         putAll.invoke(multimap, originalMap);
                     } catch (Exception ignored) {}
+                }
+                if (replaceTextures) {
+                    multimapInterface.getMethod("removeAll", Object.class).invoke(multimap, "textures");
                 }
                 if (putMethod != null) {
                     putMethod.invoke(multimap, "textures", prop);
@@ -137,6 +146,12 @@ public class SkinBridgeHook {
                     activeModel = v;
                 } else if ("hash".equals(k)) {
                     activeHash = v;
+                } else if ("cape".equals(k)) {
+                    activeCapeHash = v;
+                } else if ("uuid".equals(k)) {
+                    activeUuid = v;
+                } else if ("localonly".equals(k)) {
+                    localOnly = Boolean.parseBoolean(v);
                 }
             } else if (kv.length == 1) {
                 try {
@@ -152,23 +167,6 @@ public class SkinBridgeHook {
         }
 
         try {
-            // 1. Check if originalMap already has non-empty textures
-            if (originalMap != null) {
-                try {
-                    Method containsKey = originalMap.getClass().getMethod("containsKey", Object.class);
-                    boolean exists = (Boolean) containsKey.invoke(originalMap, "textures");
-                    if (exists) {
-                        Method getMethod = originalMap.getClass().getMethod("get", Object.class);
-                        Object col = getMethod.invoke(originalMap, "textures");
-                        if (col instanceof Collection) {
-                            if (!((Collection<?>) col).isEmpty()) {
-                                return originalMap; // Keep genuine textures
-                            }
-                        }
-                    }
-                } catch (Exception ignored) {}
-            }
-
             // 2. Extract player name
             String name = null;
             try {
@@ -198,6 +196,23 @@ public class SkinBridgeHook {
             }
             if (id == null) {
                 id = UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(StandardCharsets.UTF_8));
+            }
+
+            boolean privateCosmetics = localOnly || Boolean.getBoolean("wiscskin.localOnly");
+            String configuredUser = System.getProperty("wiscskin.user", activeUser);
+            String configuredUuid = System.getProperty("wiscskin.uuid", activeUuid);
+            boolean ownPlayer = name.equalsIgnoreCase(configuredUser)
+                && (configuredUuid.isEmpty() || id.toString().equalsIgnoreCase(configuredUuid));
+            if (privateCosmetics && !ownPlayer) {
+                return originalMap;
+            }
+            if (!privateCosmetics && originalMap != null) {
+                try {
+                    Object textures = originalMap.getClass().getMethod("get", Object.class).invoke(originalMap, "textures");
+                    if (textures instanceof Collection && !((Collection<?>) textures).isEmpty()) {
+                        return originalMap;
+                    }
+                } catch (Exception ignored) {}
             }
 
             // 4. Resolve port
@@ -258,7 +273,13 @@ public class SkinBridgeHook {
             if ("slim".equalsIgnoreCase(model)) {
                 json.append(",\"metadata\":{\"model\":\"slim\"}");
             }
-            json.append("}}}");
+            json.append("}");
+            String capeHash = System.getProperty("wiscskin.cape", activeCapeHash);
+            if (ownPlayer && capeHash != null && !capeHash.isEmpty()) {
+                json.append(",\"CAPE\":{\"url\":\"http://127.0.0.1:").append(port);
+                json.append("/capes/").append(capeHash).append(".png\"}");
+            }
+            json.append("}}");
 
             String b64 = Base64.getEncoder().encodeToString(json.toString().getBytes(StandardCharsets.UTF_8));
 
@@ -278,7 +299,7 @@ public class SkinBridgeHook {
                 System.out.println("[WiscSkinBridge] Activated skin profile for player: " + name);
             }
 
-            return cache.createPropertyMap(originalMap, prop);
+            return cache.createPropertyMap(originalMap, prop, privateCosmetics);
 
         } catch (Throwable t) {
             System.err.println("[WiscSkinBridge] Error filling properties: " + t.getMessage());

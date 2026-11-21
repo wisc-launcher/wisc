@@ -38,7 +38,7 @@ from wisc.core.credentials import redact_credentials
 from wisc.core.paths import ASSETS_DIR
 from wisc.services.instances import check_internet_connection, read_game_output
 from wisc.services.instances import installation_sources_stamp, sync_local_installations
-from wisc.core.themes import get_theme, get_theme_names
+from wisc.core.themes import CUSTOM_THEME, get_theme, get_theme_names, normalize_accent
 from wisc.services.launcher import (
     discover_local_instances,
     get_external_installations,
@@ -94,7 +94,7 @@ def main(page: ft.Page):
     online_available = False
     handled_external_profile_ids = load_handled_external_profile_ids()
     theme_choice = load_theme_choice(available_themes)
-    theme = glass_palette(get_theme(theme_choice))
+    theme = glass_palette(get_theme(theme_choice, settings["custom_accent"]))
     ui_theme.apply_legacy_theme(theme)
     selected_theme = state.selected_theme
     selected_theme["name"] = theme_choice
@@ -254,7 +254,7 @@ def main(page: ft.Page):
             return
 
         discord_presence.set_player(
-            username, get_account_avatar_bytes(active_acc, scale=1),
+            username, skins.get_account_presence_avatar_bytes(active_acc),
         )
 
         if not target.get("loader"):
@@ -383,8 +383,10 @@ def main(page: ft.Page):
             state.launcher_log_state["downloading"] = False
             game_account = getattr(process, "wisc_presence_player", active_acc)
             game_face = getattr(process, "wisc_presence_face", None)
-            if game_face is None:
-                game_face = get_account_avatar_bytes(game_account, scale=1)
+            if game_account.get("type") == "offline":
+                game_face = None
+            elif game_face is None:
+                game_face = skins.get_account_presence_avatar_bytes(game_account)
             discord_presence.game_started(
                 target,
                 player_name=str(game_account.get("username") or username),
@@ -656,6 +658,29 @@ def main(page: ft.Page):
             for theme in available_themes
         ]
 
+    def apply_custom_theme(accent: str) -> bool:
+        accent = normalize_accent(accent)
+        if accent is None:
+            return False
+        if features.busy:
+            notify("Wait for the current operation before changing themes.", "warning")
+            return False
+        current = load_settings()
+        updated = {**current, "custom_accent": accent}
+        if not save_settings(updated):
+            notify("Could not save your custom color.", "error")
+            return False
+        if not save_theme_choice(CUSTOM_THEME):
+            save_settings(current)
+            notify("Could not save the selected theme.", "error")
+            return False
+        settings.update(updated)
+        selected_theme["name"] = CUSTOM_THEME
+        page.controls.clear()
+        build_page(CUSTOM_THEME, active_page.get("name", "options_ui"))
+        notify("Custom color applied.", "success")
+        return True
+
 
     from wisc.ui.components import (
         NavigationTabs,
@@ -665,7 +690,7 @@ def main(page: ft.Page):
     )
 
     def build_page(theme_select, tab="home"):
-        theme = glass_palette(get_theme(theme_select))
+        theme = glass_palette(get_theme(theme_select, settings["custom_accent"]))
         background.reset_surfaces()
         if features.library:
             features.library.leave()
@@ -979,6 +1004,7 @@ def main(page: ft.Page):
                 set_orbs_enabled=set_orbs_enabled,
                 show_dialog_with_blur=show_dialog_with_blur,
                 close_dialog_with_blur=close_dialog_with_blur,
+                apply_custom_theme=apply_custom_theme,
             )[name]
 
         def finish_onboarding(theme_name: str, destination: str) -> bool:
@@ -1044,6 +1070,7 @@ def main(page: ft.Page):
                 content = OnboardingView(
                     page=page, theme_name=theme_select, assets_dir=ASSETS_DIR,
                     artwork_source=background.artwork.source, on_complete=finish_onboarding,
+                    custom_accent=settings["custom_accent"],
                 )
             elif name == "mods":
                 content = features.mods

@@ -110,8 +110,12 @@ def relocate_class(data: bytes, old_pkg: bytes, new_pkg: bytes) -> bytes:
 def build(install_dir: Path | None = None) -> Path:
     print("[WiscSkinBridge Build] Starting build...")
     asm_jar = find_asm_jar()
+    if asm_jar is None and OUTPUT_JAR.is_file():
+        with zipfile.ZipFile(OUTPUT_JAR) as bundled:
+            if "wisc/skinbridge/asm/ClassReader.class" in bundled.namelist():
+                asm_jar = OUTPUT_JAR
     if not asm_jar:
-        raise RuntimeError("Could not find asm jar in .minecraft libraries.")
+        raise RuntimeError("Could not find ASM in Minecraft libraries or the bundled bridge.")
     print(f"[WiscSkinBridge Build] Using ASM from: {asm_jar}")
 
     javac = find_javac()
@@ -137,6 +141,10 @@ def build(install_dir: Path | None = None) -> Path:
                 target_file = CLASSES_DIR / rel_path
                 target_file.parent.mkdir(parents=True, exist_ok=True)
                 target_file.write_bytes(relocated)
+            elif member.filename.startswith("wisc/skinbridge/asm/") and member.filename.endswith(".class"):
+                target_file = CLASSES_DIR / member.filename
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+                target_file.write_bytes(z.read(member))
 
     # 2. Compile SkinBridge sources with --release 8
     print("[WiscSkinBridge Build] Compiling Java sources (--release 8)...")

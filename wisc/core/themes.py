@@ -197,10 +197,51 @@ THEMES = {
 }
 
 DEFAULT_THEME = "Earth 2"
+CUSTOM_THEME = "Custom"
+DEFAULT_CUSTOM_ACCENT = "#46BA34"
 
 
-def get_theme(name: str) -> dict:
+def normalize_accent(value: object) -> str | None:
+    """Accept a hex RGB color and return its canonical six-digit spelling."""
+    if not isinstance(value, str):
+        return None
+    digits = value.strip().removeprefix("#")
+    if len(digits) == 3:
+        digits = "".join(char * 2 for char in digits)
+    if len(digits) != 6 or any(char not in "0123456789abcdefABCDEF" for char in digits):
+        return None
+    return f"#{digits.upper()}"
+
+
+def custom_theme(accent: str) -> dict[str, str]:
+    """Build custom action colors with readable text on any chosen accent."""
+    from colorsys import rgb_to_hsv, hsv_to_rgb
+
+    accent = normalize_accent(accent) or DEFAULT_CUSTOM_ACCENT
+    rgb = tuple(int(accent[index:index + 2], 16) / 255 for index in (1, 3, 5))
+    hue, saturation, value = rgb_to_hsv(*rgb)
+
+    def variant(brightness: float, saturation: float) -> str:
+        channels = hsv_to_rgb(hue, saturation, brightness)
+        return "#" + "".join(f"{round(channel * 255):02X}" for channel in channels)
+
+    linear = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+              for channel in rgb]
+    luminance = sum(channel * weight for channel, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+    on_accent = "#FFFFFF" if (1.05 / (luminance + 0.05)) > ((luminance + 0.05) / 0.05) else "#000000"
+    return {
+        **THEMES[DEFAULT_THEME],
+        "btn_primary": accent,
+        "btn_primary_hover": variant(min(1, value + 0.10), max(0, saturation - 0.08)),
+        "btn_primary_active": variant(max(0, value - 0.10), saturation),
+        "btn_primary_text": on_accent,
+    }
+
+
+def get_theme(name: str, custom_accent: str = DEFAULT_CUSTOM_ACCENT) -> dict:
     """Fetch color scheme dictionary by name with automatic fallback."""
+    if name == CUSTOM_THEME:
+        return custom_theme(custom_accent)
     return THEMES.get(name, THEMES[DEFAULT_THEME])
 
 def get_pagecolor():
@@ -208,4 +249,4 @@ def get_pagecolor():
 
 def get_theme_names() -> list[str]:
     """Get list of available theme names for UI menus."""
-    return list(THEMES.keys())
+    return [*THEMES, CUSTOM_THEME]

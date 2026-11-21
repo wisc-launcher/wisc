@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -11,6 +12,7 @@ import minecraft_launcher_lib
 
 from wisc.core.credentials import CredentialStore, _tokens
 from wisc.core.paths import RESOURCE_ROOT, launcher_data_dir
+from wisc.core.themes import DEFAULT_CUSTOM_ACCENT, normalize_accent
 
 LEGACY_DATA_DIR = RESOURCE_ROOT / ".data"
 
@@ -96,6 +98,8 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "launch_action": "Hide launcher",
     "capture_logs": True,
     "enable_orbs": True,
+    "custom_accent": DEFAULT_CUSTOM_ACCENT,
+    "offline_cosmetics": {},
     "enable_custom_skins": True,
     "discord_rpc": True,
     "check_updates_automatically": True,
@@ -141,6 +145,20 @@ def load_settings() -> dict[str, object]:
 
     if "active_skin" in saved and isinstance(saved["active_skin"], dict):
         settings["active_skin"] = saved["active_skin"]
+
+    settings["custom_accent"] = normalize_accent(saved.get("custom_accent")) or DEFAULT_CUSTOM_ACCENT
+    cosmetics = saved.get("offline_cosmetics")
+    if isinstance(cosmetics, dict):
+        settings["offline_cosmetics"] = {
+            account_id: {
+                "model": "slim" if record.get("model") == "slim" else "classic",
+                **{kind: filename for kind in ("skin", "cape")
+                   if isinstance(filename := record.get(kind), str)
+                   and re.fullmatch(kind + r"_[0-9a-f]{20}\.png", filename)},
+            }
+            for account_id, record in cosmetics.items()
+            if isinstance(account_id, str) and account_id and isinstance(record, dict)
+        }
 
     if settings["launch_action"] not in (
         "Hide launcher",

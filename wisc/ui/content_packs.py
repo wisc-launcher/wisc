@@ -15,7 +15,7 @@ from wisc.ui.controls import (AcrylicSelector, launcher_button, launcher_icon_bu
                               select_tab, search_input, rounded_artwork, format_size, format_downloads, card_surface)
 from wisc.ui.mod_details import open_link
 from wisc.ui.mod_list import ModList
-from wisc.ui.modpacks import CONTENT_OPTIONS, PROVIDER_OPTIONS, SORT_OPTIONS
+from wisc.ui.modpacks import CONTENT_OPTIONS, PROVIDER_OPTIONS, SORT_OPTIONS, PackDetailsPage
 from wisc.ui.motion import StaggeredReveal
 from wisc.ui.profiles import profile_list_surface
 from wisc.ui.progress import track_progress
@@ -69,6 +69,9 @@ class ContentPacksPage(ft.Container):
         self._installing = False
         self._operation_id = 0
         self._states = {}
+        self._details_open = False
+        self._detail_local = None
+        self._detail_filename = ""
         self._queries = {"browse": "", "installed": ""}
         self._scrolls = {"browse": 0.0, "installed": 0.0}
         self.heading = _text("Shaders", 24, emphasis=True)
@@ -98,14 +101,24 @@ class ContentPacksPage(ft.Container):
         self.list_host = profile_list_surface(self.list_body)
         self.file_picker = ft.FilePicker()
         page.services.append(self.file_picker)
-        super().__init__(expand=True, visible=False, content=ft.Column([
+        self.listing = ft.Container(expand=True, content=ft.Column([
             self.header, self.tabs, self.toolbar, self.note, self.status_row, self.list_host,
         ], expand=True, spacing=12, horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
+        self.details_page = PackDetailsPage(
+            page, client=client, content_kind=self.kind, get_profile=lambda: self.profile,
+            on_back=self.close_details,
+            on_install=lambda project, version: self._page.run_task(self._prepare_install, project, version),
+            can_install=lambda: bool(self.manager) and not self.busy and not self._other_busy() and not self._is_running(),
+            on_remove=lambda e: self._confirm_remove(self._detail_local) if self._detail_local else None,
+            progress=progress,
+        )
+        self.details_host = ft.Container(expand=True, visible=False, content=self.details_page)
+        super().__init__(expand=True, visible=False, content=ft.Stack([self.listing, self.details_host], expand=True))
         self.reveal = StaggeredReveal(page, self.list_host)
 
     @property
     def reveal_controls(self) -> list[ft.Control]:
-        return [self.header, self.tabs, self.toolbar, self.note, self.list_host]
+        return self.details_page.reveal_controls if self._details_open else [self.header, self.tabs, self.toolbar, self.note, self.list_host]
 
     def _update(self) -> None:
         if self._active:
@@ -115,6 +128,12 @@ class ContentPacksPage(ft.Container):
                 pass
 
     def enter(self, kind: str, *, defer_load: bool = False) -> None:
+        if kind != self.kind and self._details_open:
+            self.details_page.leave()
+            self._details_open = False
+            self.listing.visible = True
+            self.details_host.visible = False
+        self.details_page.content_kind = kind
         self.kind = kind
         self._active = True
         self.list_view.reset_viewport()
@@ -135,6 +154,8 @@ class ContentPacksPage(ft.Container):
         self.hits = []
         self.total_hits = 0
         self.refresh(defer_load=defer_load)
+        if self._details_open:
+            self.details_page.resume()
 
     def leave(self) -> None:
         self._scrolls[self.view] = self.list_view._scroll_pixels
@@ -146,6 +167,7 @@ class ContentPacksPage(ft.Container):
         self._pending_load = None
         self._finish_load()
         self.reveal.finish(update=False)
+        self.details_page.leave()
         if self._review_open:
             self._close_review()
         elif not self._installing:
@@ -219,7 +241,7 @@ class ContentPacksPage(ft.Container):
 
     async def _restore_scroll(self, generation: int) -> None:
         await asyncio.sleep(0.06)
-        if generation == self._generation and self._active:
+        if generation == self._generation and self._active and not self._details_open:
             try:
                 await self.list_view.scroll_to(offset=self._scrolls[self.view], duration=0)
             except RuntimeError:
@@ -304,6 +326,7 @@ class ContentPacksPage(ft.Container):
                 self._show_notification(str(error), "error")
 
     def _render(self) -> None:
+        self._sync_details()
         label = CONTENT_LABELS[self.kind]
         browse = self.view == "browse"
         locked = self.busy or self._other_busy()
@@ -371,11 +394,53 @@ class ContentPacksPage(ft.Container):
                              _text(detail, 12, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)], expand=True, spacing=4)
         identifier = item.filename if installed else item.get("project_id")
         return card_surface(
-            ft.Row([ft.Row([rounded_artwork(icon, size=48), details], spacing=16, expand=True), action], spacing=12,
+            ft.Row([ft.GestureDetector(content=ft.Row([rounded_artwork(icon, size=48), details], spacing=16),
+                                      expand=True, mouse_cursor=ft.MouseCursor.CLICK,
+                                      on_tap=lambda e: self.open_details(item)), action], spacing=12,
                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
             glow_color=theme.GLOW, horizontal_padding=16,
             data=(self.kind, self.view, identifier), key=ft.ValueKey(f"content-{self.kind}-{self.view}-{identifier}"),
         )
+
+    def open_details(self, item: dict | LocalContentPack) -> None:
+        if self.busy:
+            return
+        self._scrolls[self.view] = self.list_view._scroll_pixels
+        self.reveal.finish(update=False)
+        self._detail_local = item if isinstance(item, LocalContentPack) else None
+        self._detail_filename = self._detail_local.filename if self._detail_local else ""
+        if self._detail_local:
+            item = {"project_id": item.project_id, "title": item.title,
+                    "description": f"{item.filename} · {format_size(item.size)}",
+                    "body": f"Installed in `{CONTENT_FOLDERS[self.kind]}/{item.filename}`.\n\n"
+                            f"{self.note.value}", "project_type": self.kind}
+        self._details_open = True
+        self.listing.visible = False
+        self.details_host.visible = True
+        self.details_page.open(item)
+        self._sync_details()
+        self._update()
+
+    def _sync_details(self) -> None:
+        if not self._details_open:
+            return
+        project_id = self.details_page.project.get("project_id")
+        if self._detail_filename:
+            self._detail_local = next((pack for pack in self.local_packs if pack.filename == self._detail_filename), None)
+        else:
+            self._detail_local = next((pack for pack in self.local_packs if project_id and pack.project_id == project_id), None)
+        self.details_page.installed = self._detail_local is not None
+        self.details_page.remove_button.visible = self._detail_local is not None
+        self.details_page.render()
+
+    def close_details(self) -> None:
+        self.details_page.leave()
+        self._details_open = False
+        self.details_host.visible = False
+        self.listing.visible = True
+        self._render()
+        self._update()
+        self._page.run_task(self._restore_scroll, self._generation)
 
     def _can_operate(self) -> bool:
         if self.busy or self._other_busy() or self._is_running() or not self.manager:
@@ -383,7 +448,7 @@ class ContentPacksPage(ft.Container):
             return False
         return True
 
-    async def _prepare_install(self, project: dict) -> None:
+    async def _prepare_install(self, project: dict, requested_version: dict | None = None) -> None:
         if not self._can_operate():
             return
         generation, manager, profile, kind = self._generation, self.manager, self.profile.copy(), self.kind
@@ -402,6 +467,10 @@ class ContentPacksPage(ft.Container):
             if not versions:
                 raise ValueError("No compatible ZIP is available for this Minecraft version.")
             default = next((v for v in versions if v.get("version_type") == "release"), versions[0])
+            if requested_version:
+                default = next((v for v in versions if v["id"] == requested_version.get("id")), None)
+                if default is None:
+                    raise ValueError("This pack version is no longer compatible with the selected profile.")
             selector = AcrylicSelector([(v["id"], f"{v.get('version_number') or v.get('name')} · {v.get('version_type', 'release')}") for v in versions],
                                        default["id"], lambda e: update_version(), width=440, tooltip="Pack version")
             detail = _text("", 12)
@@ -497,6 +566,8 @@ class ContentPacksPage(ft.Container):
                 with track_progress(self._progress, "Removing pack...", priority=80):
                     await asyncio.to_thread(manager.remove, item, can_commit=lambda: not self._is_running())
                 self._show_notification(f"Removed {item.title}.", "success")
+                if self._details_open and self._detail_local and self._detail_local.filename == item.filename:
+                    self.close_details()
                 self._on_changed()
             except Exception as error:
                 self._show_notification(str(error), "error")

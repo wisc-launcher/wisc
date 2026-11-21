@@ -11,6 +11,7 @@ import flet as ft
 from wisc.services import skins
 from wisc.ui.skin_viewer import SkinViewer
 from wisc.ui.glass import glass_panel
+from wisc.ui.controls import launcher_button
 from pathlib import Path
 import hashlib
 from wisc.core.storage import get_active_account
@@ -24,6 +25,13 @@ from wisc.ui.components import (
 )
 
 def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_available=True, navigate=None, features=None):
+    active_acc = get_active_account()
+    is_offline_acc = active_acc.get("type") == "offline"
+    offline_account_id = str(active_acc.get("id", ""))
+
+    def current_choice():
+        return skins.load_offline_cosmetics(offline_account_id) if is_offline_acc else skins.load_active_skin_choice()
+
     def is_online():
         return bool(online_available() if callable(online_available) else online_available)
 
@@ -42,7 +50,7 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
             if msg and notify:
                 notify(msg, ft.Icons.OPEN_IN_NEW)
 
-    active_skin_data = skins.load_active_skin_choice()
+    active_skin_data = current_choice()
     skin_model_state = {"value": active_skin_data.get("model", "classic")}
     skin_view_state = {"value": "3d"}
 
@@ -94,7 +102,7 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
     def get_effective_skin_image() -> Image.Image:
         uname = player_name_state["value"].strip()
         model = skin_model_state["value"]
-        choice = skins.load_active_skin_choice()
+        choice = current_choice()
         key = f"{uname}_{model}_{choice}"
 
         if cached_skin_key[0] == key and cached_skin_im[0] is not None:
@@ -152,9 +160,17 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
 
     def render_current_character() -> bytes:
         skin_im = get_effective_skin_image()
-        key = (id(skin_im), skin_model_state['value'])
+        cape_path = current_choice().get("cape_path", "")
+        key = (id(skin_im), skin_model_state['value'], cape_path)
         if renderer_key[0] != key:
-            viewer.set_renderer(skins.SkinRenderer(skin_im, skin_model_state['value'], 'hero'))
+            cape_image = None
+            if cape_path:
+                try:
+                    with Image.open(cape_path) as cape:
+                        cape_image = cape.convert("RGBA")
+                except (OSError, ValueError):
+                    pass
+            viewer.set_renderer(skins.SkinRenderer(skin_im, skin_model_state['value'], 'hero', cape=cape_image))
             renderer_key[0] = key
         return viewer.render_still()
 
@@ -285,8 +301,9 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
             model_badge_text.update()
         except Exception:
             pass
-        choice = skins.load_active_skin_choice()
-        skins.save_active_skin_choice(choice.get('skin_type', 'ely'), model=model_name, custom_path=choice.get('custom_path', ''))
+        choice = current_choice()
+        if not is_offline_acc:
+            skins.save_active_skin_choice(choice.get('skin_type', 'ely'), model=model_name, custom_path=choice.get('custom_path', ''))
         invalidate_skin_cache()
         update_preview()
         ref_acc = launcher_log_state.get("refresh_account_picture")
@@ -294,7 +311,15 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
             ref_acc()
 
     async def sync_skin_network(force=False):
-        if skins.load_active_skin_choice().get('skin_type') == 'custom':
+        if is_offline_acc:
+            choice = current_choice()
+            status_dot.bgcolor = theme['btn_primary']
+            status_text.value = "Local skin & cape" if choice['custom_path'] and choice['cape_path'] else "Local skin" if choice['custom_path'] else "Local cape" if choice['cape_path'] else "Default skin"
+            invalidate_skin_cache()
+            update_preview()
+            page.update()
+            return
+        if current_choice().get('skin_type') == 'custom':
             status_dot.bgcolor = theme['btn_primary']
             status_text.value = 'Custom Skin'
             invalidate_skin_cache()
@@ -379,6 +404,9 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
         if not files or not files[0].path:
             return
         try:
+            if is_offline_acc:
+                await upload_offline_cosmetic("skin", files[0].path)
+                return
             with Image.open(files[0].path) as image:
                 if image.size not in ((64, 64), (64, 32)):
                     raise ValueError('Choose a 64x64 or legacy 64x32 Minecraft skin.')
@@ -413,9 +441,53 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
         update_preview()
         page.run_task(sync_skin_network, False)
 
+    cape_status = ft.Text("Cape selected" if active_skin_data.get("cape_path") else "No cape selected",
+                          size=12, color=theme["text_secondary"])
+
+    def refresh_offline_cosmetics():
+        choice = current_choice()
+        skin_model_state["value"] = choice["model"]
+        model_badge_text.value = "Slim Model (Alex • 3px arms)" if choice["model"] == "slim" else "Classic Model (Steve • 4px arms)"
+        cape_status.value = "Cape selected" if choice["cape_path"] else "No cape selected"
+        remove_cape_button.visible = bool(choice["cape_path"])
+        invalidate_skin_cache()
+        renderer_key[0] = None
+        update_preview()
+        page.run_task(sync_skin_network, False)
+        refresh = launcher_log_state.get("refresh_account_picture")
+        if callable(refresh):
+            refresh()
+        page.update()
+
+    async def upload_offline_cosmetic(kind, path):
+        if str(get_active_account().get("id", "")) != offline_account_id:
+            raise ValueError("Your active account changed. Choose the file again for that account.")
+        await asyncio.to_thread(skins.save_offline_cosmetic, offline_account_id, kind, path)
+        refresh_offline_cosmetics()
+        notify(f"Offline {kind} selected. Visible only to you on your next launch.", ft.Icons.CHECK_CIRCLE)
+
+    async def choose_offline_cape(e):
+        files = await file_picker.pick_files(allow_multiple=False, allowed_extensions=['png'], file_type=ft.FilePickerFileType.CUSTOM)
+        if not files or not files[0].path:
+            return
+        try:
+            await upload_offline_cosmetic("cape", files[0].path)
+        except (OSError, ValueError) as error:
+            notify(str(error), ft.Icons.ERROR_OUTLINE)
+
+    def clear_offline(kind):
+        if not skins.clear_offline_cosmetic(offline_account_id, kind):
+            notify(f"Could not remove the offline {kind}.", ft.Icons.ERROR_OUTLINE)
+            return
+        refresh_offline_cosmetics()
+
+    remove_cape_button = launcher_button("Remove cape", lambda e: clear_offline("cape"),
+                                        visible=bool(active_skin_data.get("cape_path")))
+
     custom_skin_controls = ft.Row([
         ft.Button('Choose skin PNG', on_click=choose_custom_skin, disabled=page.web,
                   bgcolor=theme['btn_secondary'], color=theme['text_primary']),
+        launcher_button('Reset skin', lambda e: clear_offline("skin")) if is_offline_acc else
         ft.TextButton('Use Ely.by skin', on_click=use_ely_skin)], wrap=True)
     refresh_skin_btn = ft.Button(
         "Refresh",
@@ -488,7 +560,7 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
                 ft.Column(
                     spacing=6,
                     controls=[
-                        ft.Text("PLAYER", size=11, weight=ft.FontWeight.BOLD, color=theme["text_secondary"]),
+                        ft.Text("OFFLINE SKIN & CAPE" if is_offline_acc else "PLAYER", size=11, weight=ft.FontWeight.BOLD, color=theme["text_secondary"]),
                         player_label,
                         ft.Row(
                             spacing=8,
@@ -497,6 +569,7 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
                         ),
                         ft.Container(height=6),
                         ft.Row(
+                            visible=not is_offline_acc,
                             spacing=10,
                             controls=[
                                 refresh_skin_btn,
@@ -514,13 +587,22 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
                         custom_skin_controls,
                     ],
                 ),
+                *([ft.Column([
+                    ft.Text("OFFLINE CAPE", size=11, weight=ft.FontWeight.BOLD, color=theme["text_secondary"]),
+                    ft.Text("Upload a 64×32 cape PNG, or the same layout at a larger size.", size=12, color=theme["text_secondary"]),
+                    cape_status,
+                    ft.Row([
+                        launcher_button("Choose cape PNG", choose_offline_cape, disabled=page.web),
+                        remove_cape_button,
+                    ], spacing=8, wrap=True),
+                ], spacing=8)] if is_offline_acc else []),
             ],
         ),
     )
 
     footer_credit = ft.Container(
         content=ft.Text(
-            "Skin network powered by Ely.by",
+            "Visible only in your own game client. Other players see your normal appearance." if is_offline_acc else "Skin network powered by Ely.by",
             size=11,
             color=ft.Colors.with_opacity(0.5, theme["text_secondary"]),
             text_align=ft.TextAlign.CENTER,
@@ -537,80 +619,11 @@ def build_skins_view(page: ft.Page, theme: dict, notify, open_url=None, online_a
         lambda: active_page.get("name") == "skins",
     )
 
-    active_acc = get_active_account()
-    is_offline_acc = active_acc.get("type") == "offline"
-
-    offline_locked_card = glass_panel(
-        width=520,
-        padding=ft.Padding.all(36),
-        border_radius=18,
-        bgcolor=theme["card"],
-        border=ft.Border.all(1, color=theme["border"]),
-        content=ft.Column(
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            alignment=ft.MainAxisAlignment.CENTER,
-            spacing=16,
-            controls=[
-                ft.Container(
-                    width=64,
-                    height=64,
-                    border_radius=32,
-                    bgcolor=ft.Colors.with_opacity(0.12, theme["btn_primary"]),
-                    alignment=ft.Alignment.CENTER,
-                    content=ft.Icon(ft.Icons.LOCK_OUTLINED, size=32, color=theme["btn_primary"]),
-                ),
-                ft.Text(
-                    "Skins Disabled",
-                    size=20,
-                    weight=ft.FontWeight.BOLD,
-                    color=theme["text_primary"],
-                    text_align=ft.TextAlign.CENTER,
-                ),
-                ft.Text(
-                    "Skins are disabled in offline mode. Log in to customize skins.",
-                    size=13,
-                    color=theme["text_secondary"],
-                    text_align=ft.TextAlign.CENTER,
-                ),
-                ft.Container(height=10),
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    spacing=12,
-                    controls=[
-                        ft.Button(
-                            "Log In with Ely.by",
-                            icon=ft.Icons.LOGIN,
-                            bgcolor=theme["btn_primary"],
-                            color=theme.get("btn_primary_text", theme["text_primary"]),
-                            style=rounded_button_style,
-                            on_click=lambda e: navigate("options_accounts") if callable(navigate) else None,
-                        ),
-                        ft.Button(
-                            "Create Free Account",
-                            icon=ft.Icons.OPEN_IN_NEW,
-                            bgcolor=theme["surface"],
-                            color=theme["text_secondary"],
-                            style=rounded_button_style,
-                            on_click=lambda e: open_url("https://account.ely.by/register", "Opening Ely.by registration..."),
-                        ),
-                    ],
-                ),
-            ],
-        ),
-    )
-
-    main_skins_content = (
-        offline_locked_card
-        if is_offline_acc
-        else ft.Row(
-            alignment=ft.MainAxisAlignment.CENTER,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-            spacing=24,
-            controls=[
-                left_preview_card,
-                right_settings_card,
-            ],
-        )
+    main_skins_content = ft.Row(
+        alignment=ft.MainAxisAlignment.CENTER,
+        vertical_alignment=ft.CrossAxisAlignment.START,
+        spacing=24,
+        controls=[left_preview_card, right_settings_card],
     )
 
     return ft.Stack(

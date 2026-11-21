@@ -11,12 +11,15 @@ import flet as ft
 from wisc.ui.controls import LegacySelector, SimpleInput, launcher_button, launcher_back_button
 from wisc.ui.scroll_views import ScrollColumn
 from wisc.ui.glass import glass_panel
+from wisc.ui.settings_art import settings_art
+from wisc.ui.theme_picker import ThemePicker, color_wheel_surface
 from wisc.services import updates as launcher_updates
 from wisc.core.themes import DEFAULT_THEME
 import json
 import threading
 from wisc.core.storage import (
     DEFAULT_SETTINGS,
+    load_settings,
     save_settings,
     save_theme_choice,
     load_accounts,
@@ -93,7 +96,7 @@ def build_options_views(
     notify,
     copy_to_clipboard,
     open_url,
-    theme_dropdown: ft.Dropdown,
+    theme_dropdown: LegacySelector,
     available_themes: list[str],
     maximum_memory_mb: int,
     minecraft_directory: str,
@@ -106,6 +109,7 @@ def build_options_views(
     show_dialog_with_blur = None,
     close_dialog_with_blur = None,
     features = None,
+    apply_custom_theme = None,
 ) -> dict[str, ft.Control]:
     selected_theme = state.selected_theme
     active_page = state.active_page
@@ -125,12 +129,7 @@ def build_options_views(
             spacing=16,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
-                ft.Container(
-                    width=48, height=48, border_radius=12,
-                    bgcolor=ft.Colors.with_opacity(0.12, theme["btn_primary"]),
-                    alignment=ft.Alignment.CENTER,
-                    content=ft.Icon(category["icon"], size=25, color=theme["btn_primary"]),
-                ),
+                settings_art(category["art"], theme["btn_primary"], width=48, height=48),
                 ft.Column(
                     expand=True, spacing=5,
                     alignment=ft.MainAxisAlignment.CENTER,
@@ -146,24 +145,24 @@ def build_options_views(
         )
         return glass_panel(
             button, border_radius=12, bgcolor=theme["surface"],
-            col={"xs": 12, "md": 6, "xl": 4},
+            col={"xs": 12, "md": 6, "lg": 4},
         )
 
     options_categories = [
-        {"id": "options_ui", "title": "Appearance", "icon": ft.Icons.PALETTE_OUTLINED,
-         "description": "Color palette and background effects"},
-        {"id": "options_java", "title": "Java & Memory", "icon": ft.Icons.MEMORY,
+        {"id": "options_ui", "title": "Appearance", "art": "appearance",
+         "description": "Your colors, your atmosphere"},
+        {"id": "options_java", "title": "Java & Memory", "art": "java",
          "description": "Java executable and allocated RAM"},
-        {"id": "options_game", "title": "Game", "icon": ft.Icons.SPORTS_ESPORTS_OUTLINED,
+        {"id": "options_game", "title": "Game", "art": "game",
          "description": "Window size, fullscreen and skins"},
-        {"id": "options_accounts", "title": "Accounts", "icon": ft.Icons.PERSON_OUTLINE,
+        {"id": "options_accounts", "title": "Accounts", "art": "accounts",
          "description": "Manage players, sign-ins and skins"},
-        {"id": "options_launcher", "title": "Launcher", "icon": ft.Icons.TUNE,
+        {"id": "options_launcher", "title": "Launcher", "art": "launcher",
          "description": "Launch behavior, Discord and logs"},
     ]
     if features:
         options_categories.append(
-            {"id": "options_updates", "title": "Updates", "icon": ft.Icons.SYSTEM_UPDATE_ALT,
+            {"id": "options_updates", "title": "Updates", "art": "updates",
              "description": "Check for the latest Wisc release"})
 
     category_cards = [build_option_card(category) for category in options_categories]
@@ -206,10 +205,28 @@ def build_options_views(
             ],
         ),
     )
+    dashboard_hero = glass_panel(
+        bgcolor=theme["surface"], border_radius=12,
+        padding=ft.Padding.symmetric(horizontal=24, vertical=18),
+        content=ft.Row([
+            ft.Column([
+                ft.Text("Color studio", size=24, weight=ft.FontWeight.W_600,
+                        color=theme["text_primary"]),
+                ft.Text("Dial in your own accent with a color wheel and live preview.",
+                        size=13, color=theme["text_secondary"]),
+                launcher_button("Customize your colors", lambda e: navigate("options_ui"),
+                                primary=True, height=36),
+            ], expand=True, spacing=10),
+            ft.Container(
+                content=color_wheel_surface(116), width=116, height=116,
+                ignore_interactions=True, opacity=0.9,
+            ),
+        ], spacing=24, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+    )
     options_orb1, options_orb2 = create_ambient_gradient_orbs(theme, settings.get("enable_orbs", True))
     options_dashboard = ft.Stack(
         expand=True, clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-        data={"reveal_controls": [dashboard_header, *category_cards, dashboard_footer]},
+        data={"reveal_controls": [dashboard_header, dashboard_hero, *category_cards, dashboard_footer]},
         controls=[
             options_orb1, options_orb2,
             ft.Container(
@@ -219,6 +236,7 @@ def build_options_views(
                     horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                     controls=[
                         dashboard_header,
+                        dashboard_hero,
                         ft.ResponsiveRow(category_cards, spacing=12, run_spacing=12),
                         dashboard_footer,
                     ],
@@ -285,6 +303,8 @@ def build_options_views(
             "About": "The launcher, its creator and your game files.",
             "Updates": "Keep Wisc up to date.",
         }
+        header_art = {"Appearance": "appearance", "Java & Memory": "java", "Game": "game",
+                      "Launcher": "launcher", "Updates": "updates"}.get(title)
         header = ft.Row(
             spacing=16, vertical_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
@@ -296,6 +316,7 @@ def build_options_views(
                         ft.Text(subtitles.get(title, ""), size=12, color=theme["text_secondary"]),
                     ],
                 ),
+                *([settings_art(header_art, theme["btn_primary"], width=58, height=50)] if header_art else []),
                 *([launcher_button("Reset defaults", on_reset, icon=ft.Icons.RESTORE)] if on_reset else []),
             ],
         )
@@ -351,7 +372,7 @@ def build_options_views(
                 tooltip="Background",
             ),
             ft.Text(
-                f"Active Palette: {selected_theme['name']}",
+                f"{selected_theme['name']} · {theme['btn_primary'].upper()}",
                 size=11,
                 color=theme["text_muted"],
             ),
@@ -363,30 +384,51 @@ def build_options_views(
         notify(message, ft.Icons.RESTORE)
 
     def reset_settings_fields(field_names, section_name):
+        current = load_settings()
         for field_name in field_names:
-            settings[field_name] = DEFAULT_SETTINGS[field_name]
-        save_settings(settings)
+            current[field_name] = DEFAULT_SETTINGS[field_name]
+        if not save_settings(current):
+            notify("Could not restore settings.", "error")
+            return
+        settings.update(current)
         rebuild_settings_page(f"{section_name} settings restored to defaults.")
 
     def reset_ui_settings(e):
+        if features and features.busy:
+            notify("Wait for the current operation before changing themes.", "warning")
+            return
         default_theme = (
             DEFAULT_THEME
             if DEFAULT_THEME in available_themes
             else available_themes[0]
         )
-        save_theme_choice(default_theme)
+        current = load_settings()
+        updated = {**current, "enable_orbs": DEFAULT_SETTINGS["enable_orbs"],
+                   "custom_accent": DEFAULT_SETTINGS["custom_accent"]}
+        if not save_settings(updated):
+            notify("Could not save appearance settings.", "error")
+            return
+        if not save_theme_choice(default_theme):
+            save_settings(current)
+            notify("Could not save the selected theme.", "error")
+            return
+        settings.update(updated)
         selected_theme["name"] = default_theme
-        settings["enable_orbs"] = DEFAULT_SETTINGS["enable_orbs"]
-        save_settings(settings)
         rebuild_page_callback(default_theme, active_page["name"])
         notify("UI settings restored to defaults.", ft.Icons.RESTORE)
 
     ui_subpage = build_settings_page(
         "Appearance",
         [
+            *([build_setting_container(
+                "Custom color",
+                "Choose an accent for buttons, selections and focus. Preview it below, then apply.",
+                extra_content=ThemePicker(settings.get("custom_accent", theme["btn_primary"]),
+                                          theme, apply_custom_theme),
+            )] if apply_custom_theme else []),
             build_setting_container(
-                "Theme Selection",
-                "Choose the color palette for the launcher interface. Updates immediately.",
+                "Minecraft palettes",
+                "Start with a favorite palette, or return to your saved Custom color.",
                 control=theme_dropdown,
                 extra_content=theme_palette_preview,
             ),
@@ -408,8 +450,7 @@ def build_options_views(
 
     def set_ram_value(value):
         value = min(maximum_memory_mb, max(256, int(value)))
-        settings["ram_mb"] = value
-        save_settings(settings)
+        persist_setting("ram_mb", value)
         field = ram_input_ref.get("control")
         if field is not None and field.value != str(value):
             field.value = str(value)
@@ -424,8 +465,7 @@ def build_options_views(
         except (TypeError, ValueError):
             return
         if 256 <= value <= maximum_memory_mb:
-            settings["ram_mb"] = value
-            save_settings(settings)
+            persist_setting("ram_mb", value)
             ram_slider.value = value
             ram_slider.update()
 
@@ -563,9 +603,9 @@ def build_options_views(
             ),
             build_setting_container(
                 "Custom Skins",
-                "Load player skins in-game using the skin network Java agent.",
+                "Show Ely.by skins or your offline account's local skin and cape in-game.",
                 control=build_themed_switch(
-                    label="Enable in-game skins",
+                    label="Enable in-game skins and capes",
                     value=settings.get("enable_custom_skins", True),
                     theme=theme,
                     on_change=lambda e: persist_setting(

@@ -122,16 +122,21 @@ class ModpackInstallReview(ft.Column):
         return changed
 
 
-class ModpackDetailsPage(ft.Container):
+class PackDetailsPage(ft.Container):
     PAGE_SIZE = 20
 
     def __init__(self, page: ft.Page, *, client, on_back: Callable, on_install: Callable,
-                 can_install: Callable, on_cancel: Callable | None = None, progress: ProgressHost | None = None):
+                 can_install: Callable, on_cancel: Callable | None = None, progress: ProgressHost | None = None,
+                 content_kind: str = "modpack", get_profile: Callable | None = None,
+                 on_remove: Callable | None = None):
         self._page = page
         self.client = client
         self._on_install = on_install
         self._can_install = can_install
         self._progress = progress
+        self.content_kind = content_kind
+        self._get_profile = get_profile or (lambda: {})
+        self.installed = False
         self._generation = 0
         self._active = False
         self._loaded = False
@@ -143,16 +148,18 @@ class ModpackDetailsPage(ft.Container):
         self.error = ""
         self.version_offset = 0
         self.operation_phase = "idle"
-        self.back_bar = ft.Row([launcher_back_button(lambda e: on_back(), tooltip="Back to Modpacks")])
+        self.back = launcher_back_button(lambda e: on_back(), tooltip="Back to Modpacks")
+        self.back_bar = ft.Row([self.back])
         self.title = _text("Modpack", 24, emphasis=True, color=theme.TEXT, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
         self.subtitle = _text("", 12)
         self.summary = _text("", 13, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
         self.icon = ft.Container(width=64, height=64)
         self.install_button = launcher_button("Install", self._install_latest, primary=True, height=44, width=96)
         self.cancel_button = launcher_button("Cancel", on_cancel, visible=False, height=44)
+        self.remove_button = launcher_button("Remove", on_remove, visible=False, height=44)
         self.hero = profile_card_surface(ft.Row([
             self.icon, ft.Column([self.title, self.subtitle, self.summary], expand=True, spacing=5),
-            self.install_button, self.cancel_button,
+            self.install_button, self.cancel_button, self.remove_button,
         ], spacing=16, vertical_alignment=ft.CrossAxisAlignment.CENTER), glow_color=theme.GLOW, horizontal_padding=16)
         self.section_buttons = {key: launcher_tab(label, lambda e, name=key: self.set_section(name))
                                 for key, label in (("overview", "Overview"), ("versions", "Versions"), ("gallery", "Gallery"))}
@@ -190,22 +197,34 @@ class ModpackDetailsPage(ft.Container):
         self.loading = True
         self.error = ""
         self.render()
-        self._start_load()
+        if self.project.get("project_id") or self.project.get("id"):
+            self._start_load()
+        else:
+            self.loading = False
+            self._loaded = True
+            self.render()
 
     def _start_load(self) -> None:
         if self._activity:
             self._activity.finish()
-        activity = track_progress(self._progress, "Loading modpack details...", priority=45)
+        activity = track_progress(self._progress, "Loading pack details...", priority=45)
         self._activity = activity
-        self._page.run_task(self._load, self._generation, self.project.get("project_id") or self.project["id"], activity)
+        self._page.run_task(self._load, self._generation, self.project.get("project_id") or self.project["id"], activity,
+                            self.content_kind, (self._get_profile() or {}).get("minecraft_version", ""))
 
-    async def _load(self, generation: int, project_id: str, activity) -> None:
+    async def _load(self, generation: int, project_id: str, activity,
+                    kind: str = "modpack", minecraft_version: str = "") -> None:
         try:
-            project, versions = await asyncio.gather(asyncio.to_thread(self.client.modpack_project, project_id),
-                                                      asyncio.to_thread(self.client.modpack_versions, project_id))
+            if kind == "modpack":
+                project_task = asyncio.to_thread(self.client.modpack_project, project_id)
+                versions_task = asyncio.to_thread(self.client.modpack_versions, project_id)
+            else:
+                project_task = asyncio.to_thread(self.client.content_project, project_id, kind)
+                versions_task = asyncio.to_thread(self.client.content_versions, project_id, minecraft_version, kind)
+            project, versions = await asyncio.gather(project_task, versions_task)
             if generation != self._generation or not self._active:
                 return
-            self.project = project
+            self.project = {**self.project, **project}
             self.versions = versions
             self._loaded = True
             self.loading = False
@@ -260,13 +279,19 @@ class ModpackDetailsPage(ft.Container):
         self._start_load()
 
     def render(self) -> None:
+        label = {"modpack": "Modpacks", "shader": "Shaders", "resourcepack": "Texture Packs"}[self.content_kind]
+        self.back.tooltip = f"Back to {label}"
         self.title.value = self.project.get("title") or self.project.get("name", "Modpack")
         self.summary.value = self.project.get("description", "")
         self.subtitle.value = " · ".join(value for value in (
+            "Local pack" if not (self.project.get("project_id") or self.project.get("id")) else
             "CurseForge" if str(self.project.get("project_id") or self.project.get("id", "")).startswith("cf:") else "Modrinth",
-            self.project.get("author", ""), f"{len(self.versions)} versions" if self._loaded else "") if value)
+            self.project.get("author", ""),
+            f"{len(self.versions)} {'compatible ' if self.content_kind != 'modpack' else ''}versions" if self._loaded and self.versions else "") if value)
         self.icon.content = _artwork(self.project.get("icon_url"), 64)
-        self.install_button.disabled = self.loading or bool(self.error) or not self.versions or not self._can_install()
+        self.install_button.content.value = "Installed" if self.installed else "Install"
+        self.install_button.disabled = self.installed or self.loading or bool(self.error) or not self.versions or not self._can_install()
+        self.remove_button.disabled = not self._can_install()
         self.cancel_button.visible = self.operation_phase in {"preparing", "installing", "cancelling"}
         self.cancel_button.disabled = self.operation_phase == "cancelling"
         self.install_button.visible = not self.cancel_button.visible
@@ -326,7 +351,7 @@ class ModpackDetailsPage(ft.Container):
                                  max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
                            _text(details, 12, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)], expand=True, spacing=4),
                 launcher_button("Install", lambda e, selected=version: self._on_install(self.project, selected),
-                                primary=True, disabled=not self._can_install()),
+                                primary=True, disabled=self.installed or not self._can_install()),
             ], spacing=12), glow_color=theme.GLOW, horizontal_padding=16,
             data=version["id"], key=ft.ValueKey("pack-version:" + version["id"])))
         self.version_list.set_cards(rows, footer=_text("No matching pack versions. Try All releases or another search.", 13) if not rows else None)
@@ -409,7 +434,7 @@ class ModpacksPage(ft.Container):
         self.list_host = profile_list_surface(self.list_body)
         self.listing = ft.Container(expand=True, content=ft.Column([self.header, self.tabs, self.toolbar, self.status_row, self.list_host],
                                    expand=True, spacing=12, horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
-        self.details_page = ModpackDetailsPage(page, client=self.client, on_back=self.close_details,
+        self.details_page = PackDetailsPage(page, client=self.client, on_back=self.close_details,
                                              on_install=lambda project, version: self._page.run_task(self._prepare_install, project, version),
                                              can_install=self._can_operate, on_cancel=self._cancel_operation, progress=progress)
         self.details_host = ft.Container(expand=True, visible=False, content=self.details_page)

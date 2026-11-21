@@ -165,7 +165,7 @@ def build_account_login(
         username.hint_text = "Your Ely.by username or email" if mode == "ely" else "1–16 letters, numbers, or _"
         username.max_length = None if mode == "ely" else 16
         description.value = ("Use your Ely.by account for skins and Ely.by multiplayer."
-                             if mode == "ely" else "Create an offline account with a player name. Skins require Ely.by.")
+                             if mode == "ely" else "Create an offline account with a player name. Add a local skin and cape in Skins; only you will see them.")
         submit_label.value = "Log In" if mode == "ely" else "Add Account"
         select_tab(ely_tab, mode == "ely")
         select_tab(offline_tab, mode == "offline")

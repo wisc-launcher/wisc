@@ -5,7 +5,7 @@ from typing import Callable
 
 import flet as ft
 
-from wisc.core.themes import get_theme, get_theme_names
+from wisc.core.themes import DEFAULT_CUSTOM_ACCENT, get_theme, get_theme_names
 from wisc.ui.glass import GLASS_MUTED, GLASS_TEXT, glass_palette, glass_panel
 from wisc.ui.motion import StaggeredReveal
 
@@ -21,10 +21,12 @@ class OnboardingView(ft.Container):
     )
 
     def __init__(self, *, page: ft.Page, theme_name: str, assets_dir: Path,
-                 artwork_source: str, on_complete: Callable[[str, str], bool]):
+                 artwork_source: str, on_complete: Callable[[str, str], bool],
+                 custom_accent: str = DEFAULT_CUSTOM_ACCENT):
         self._ui_page = page
         self._initial_theme = theme_name
         self.theme_name = theme_name
+        self._custom_accent = custom_accent
         self.step = 0
         self.destination = "home"
         self._on_complete = on_complete
@@ -62,7 +64,7 @@ class OnboardingView(ft.Container):
 
     @property
     def palette(self) -> dict:
-        return glass_palette(get_theme(self.theme_name))
+        return glass_palette(get_theme(self.theme_name, self._custom_accent))
 
     def did_mount(self) -> None:
         self._mounted = True
@@ -147,7 +149,7 @@ class OnboardingView(ft.Container):
         names = get_theme_names()
         names = [self._initial_theme, *[name for name in names if name != self._initial_theme]]
         for name in names:
-            accent = get_theme(name)["btn_primary"]
+            accent = get_theme(name, self._custom_accent)["btn_primary"]
             selected = name == self.theme_name
             choices.append(ft.Button(
                 key=ft.ValueKey(f"onboarding-theme-{name}"), width=196, height=54,

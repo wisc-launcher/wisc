@@ -288,7 +288,8 @@ class LegacyFeatures:
         self.presence.set_enabled(bool(storage.load_settings().get("discord_rpc", True)) and not self.page.web)
 
     def player_changed(self, face_png: bytes | None = None) -> None:
-        self.presence.set_player(storage.get_active_account().get("username", "Player"), face_png)
+        account = storage.get_active_account()
+        self.presence.set_player(account.get("username", "Player"), None if account.get("type") == "offline" else face_png)
 
     def refresh_update_badge(self) -> None:
         if self.update_badge:

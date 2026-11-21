@@ -115,6 +115,83 @@ def get_tools_dir() -> Path:
     return directory
 
 
+def offline_cosmetics_dir(account_id: str) -> Path:
+    """Keep offline uploads in an account-scoped, launcher-owned directory."""
+    identifier = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:20]
+    return get_skins_dir() / "offline" / identifier
+
+
+def load_offline_cosmetics(account_id: str) -> dict[str, str]:
+    record = load_settings().get("offline_cosmetics", {}).get(account_id, {})
+    directory = offline_cosmetics_dir(account_id)
+    paths = {kind: directory / record[kind] for kind in ("skin", "cape") if record.get(kind)}
+    return {
+        "skin_type": "custom" if paths.get("skin") and paths["skin"].is_file() else "default",
+        "model": record.get("model", "classic"),
+        "custom_path": str(paths["skin"]) if paths.get("skin") and paths["skin"].is_file() else "",
+        "cape_path": str(paths["cape"]) if paths.get("cape") and paths["cape"].is_file() else "",
+    }
+
+
+def save_offline_cosmetic(account_id: str, kind: str, source: Path | str) -> dict[str, str]:
+    """Validate and copy a skin/cape PNG, then atomically save its selection."""
+    if not account_id or kind not in {"skin", "cape"}:
+        raise ValueError("Choose an offline account and a skin or cape.")
+    source = Path(source)
+    if source.stat().st_size > 4 * 1024 * 1024:
+        raise ValueError("Choose a PNG smaller than 4 MB.")
+    try:
+        with Image.open(source) as image:
+            if image.format != "PNG" or getattr(image, "n_frames", 1) != 1:
+                raise ValueError("Choose a single PNG image.")
+            valid = image.size in ((64, 64), (64, 32)) if kind == "skin" else image.size in (
+                (64, 32), (128, 64), (256, 128), (512, 256), (1024, 512))
+            if not valid:
+                raise ValueError("Choose a 64×64 or legacy 64×32 skin." if kind == "skin" else
+                                 "Choose a 64×32 cape PNG, or a larger version with the same 2:1 layout.")
+            prepared = ensure_64x64(image) if kind == "skin" else image.convert("RGBA")
+            output = io.BytesIO()
+            prepared.save(output, format="PNG")
+    except Image.DecompressionBombError as error:
+        raise ValueError("Choose a skin or cape PNG with Minecraft's supported dimensions.") from error
+    data = output.getvalue()
+    filename = f"{kind}_{hashlib.sha256(data).hexdigest()[:20]}.png"
+    directory = offline_cosmetics_dir(account_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / filename
+    existed = target.is_file()
+    temporary = target.with_suffix(".tmp")
+    try:
+        temporary.write_bytes(data)
+        temporary.replace(target)
+        settings = load_settings()
+        records = dict(settings.get("offline_cosmetics", {}))
+        record = {**records.get(account_id, {}), kind: filename}
+        if kind == "skin":
+            record["model"] = "slim" if is_slim_skin(prepared) else "classic"
+        records[account_id] = record
+        settings["offline_cosmetics"] = records
+        if not save_settings(settings):
+            if not existed:
+                target.unlink(missing_ok=True)
+            raise OSError("Could not save your offline cosmetic.")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return load_offline_cosmetics(account_id)
+
+
+def clear_offline_cosmetic(account_id: str, kind: str) -> bool:
+    if kind not in {"skin", "cape"}:
+        return False
+    settings = load_settings()
+    records = dict(settings.get("offline_cosmetics", {}))
+    record = dict(records.get(account_id, {}))
+    record.pop(kind, None)
+    records[account_id] = record
+    settings["offline_cosmetics"] = records
+    return save_settings(settings)
+
+
 def get_authlib_jar_path() -> Path:
     """Returns the target path for authlib-injector.jar."""
     return get_tools_dir() / "authlib-injector.jar"
@@ -161,17 +238,19 @@ def get_skin_bridge_jar_path() -> Path:
 def ensure_skin_bridge() -> Path | None:
     """Ensures wisc-skin-bridge.jar exists locally and is valid."""
     target_jar = get_skin_bridge_jar_path()
-    if target_jar.is_file() and target_jar.stat().st_size > 10_000:
-        return target_jar
-
     local_proj_jar = RESOURCE_ROOT / "tools" / "wisc-skin-bridge" / "wisc-skin-bridge.jar"
     if local_proj_jar.is_file():
         try:
+            if target_jar.is_file() and hashlib.sha256(target_jar.read_bytes()).digest() == hashlib.sha256(local_proj_jar.read_bytes()).digest():
+                return target_jar
             target_jar.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(local_proj_jar, target_jar)
             return target_jar
         except OSError:
             pass
+
+    if target_jar.is_file() and target_jar.stat().st_size > 10_000:
+        return target_jar
 
     try:
         build_script = RESOURCE_ROOT / "tools" / "wisc-skin-bridge" / "build_bridge.py"
@@ -282,7 +361,7 @@ def _rotate_pt_euler(x, y, z, rx, ry, rz):
     return x, y, z
 
 
-def _prepare_skin_faces(skin: Image.Image, model: str, pose: str):
+def _prepare_skin_faces(skin: Image.Image, model: str, pose: str, cape: Image.Image | None = None):
     """Prepare skin textures and posed vertices once, outside the frame loop."""
     if skin.mode != "RGBA":
         skin = skin.convert("RGBA")
@@ -457,12 +536,23 @@ def _prepare_skin_faces(skin: Image.Image, model: str, pose: str):
         },
     ]
 
+    if cape is not None:
+        cape = cape.convert("RGBA").resize((64, 32), Image.Resampling.NEAREST)
+        pivots["cape"] = (0.0, 8.0, -2.5)
+        poses["cape"] = (10.0, 0.0, 0.0)
+        boxes.append({
+            "name": "cape", "bounds": (-5, 5, -8, 8, -3.5, -2.5), "expand": 0,
+            "uv": {"front": (1, 1, 11, 17), "back": (12, 1, 22, 17),
+                   "right": (0, 1, 1, 17), "left": (11, 1, 12, 17),
+                   "top": (1, 0, 11, 1), "bottom": (11, 0, 21, 1)},
+        })
+
     faces = []
     for b_info in boxes:
         part_name = b_info["name"]
         pivot = pivots[part_name]
         rotation = tuple(math.radians(angle) for angle in poses[part_name])
-        for is_overlay in (False, True):
+        for is_overlay in ((False, True) if "overlay" in b_info else (False,)):
             exp = b_info["expand"] if is_overlay else 0.0
             x0, x1, y0, y1, z0, z1 = b_info["bounds"]
             x0, x1 = x0 - exp, x1 + exp
@@ -497,7 +587,7 @@ def _prepare_skin_faces(skin: Image.Image, model: str, pose: str):
             }
 
             for face_name, f_info in face_defs.items():
-                texture = skin.crop(uv_dict[face_name])
+                texture = (cape if part_name == "cape" else skin).crop(uv_dict[face_name])
                 if texture.getextrema()[3][1] == 0:
                     continue
                 points = []
@@ -513,8 +603,8 @@ def _prepare_skin_faces(skin: Image.Image, model: str, pose: str):
 class SkinRenderer:
     """Reusable software renderer with prepared geometry and bounded shading cache."""
 
-    def __init__(self, skin: Image.Image, model: str = "classic", pose: str = "hero"):
-        self.faces = _prepare_skin_faces(skin, model, pose)
+    def __init__(self, skin: Image.Image, model: str = "classic", pose: str = "hero", cape: Image.Image | None = None):
+        self.faces = _prepare_skin_faces(skin, model, pose, cape)
         self._shaded = OrderedDict()
         self._shade_lock = threading.Lock()
 
@@ -653,7 +743,13 @@ def get_account_head_avatar_bytes(account: dict | None = None, *, scale: int = 4
     """Render the selected account's face from local skins without network requests."""
     account = get_active_account() if account is None else account
     if account.get("type") == "offline":
-        return render_head_avatar_bytes(get_default_skin("classic"), scale=scale)
+        choice = load_offline_cosmetics(str(account.get("id", "")))
+        if choice["custom_path"]:
+            try:
+                return render_head_avatar_bytes(choice["custom_path"], scale=scale)
+            except (OSError, ValueError):
+                pass
+        return render_head_avatar_bytes(get_default_skin(choice["model"]), scale=scale)
 
     choice = load_active_skin_choice()
     candidates = []
@@ -677,6 +773,13 @@ def get_account_head_avatar_bytes(account: dict | None = None, *, scale: int = 4
         return render_head_avatar_bytes(skin_image, scale=scale)
     except Exception:
         return render_head_avatar_bytes(get_default_skin("classic"), scale=scale)
+
+
+def get_account_presence_avatar_bytes(account: dict | None) -> bytes | None:
+    """Never pass private offline cosmetics to a public portrait uploader."""
+    if not account or account.get("type") == "offline":
+        return None
+    return get_account_head_avatar_bytes(account, scale=1)
 
 
 def fetch_ely_skin(
@@ -1037,12 +1140,26 @@ class LocalSkinServer:
         skin_png_path: Path,
         model: str = "classic",
         skin_hash: str = "",
+        cape_png_path: Path | None = None,
+        local_only: bool = False,
     ):
         self.username = username
         self.uuid_str = uuid_str
         self.skin_png_path = Path(skin_png_path)
         self.model = model
         self.skin_hash = skin_hash
+        self.local_only = local_only
+        self.cape_bytes = None
+        self.cape_hash = ""
+        if cape_png_path is not None:
+            try:
+                with Image.open(cape_png_path) as cape:
+                    buffer = io.BytesIO()
+                    cape.convert("RGBA").save(buffer, format="PNG")
+                    self.cape_bytes = buffer.getvalue()
+                    self.cape_hash = hashlib.sha1(self.cape_bytes).hexdigest()
+            except (OSError, ValueError):
+                pass
         self.cached_bytes: bytes | None = None
         self._negative_cache: dict[str, float] = {}
         self._cache_lock = threading.Lock()
@@ -1099,6 +1216,10 @@ class LocalSkinServer:
                 if "/sessionserver/session/minecraft/profile/" in parsed.path:
                     # Extract the requested UUID from the path: .../profile/<uuid>
                     req_uuid = parsed.path.split("/sessionserver/session/minecraft/profile/")[-1].split("?")[0].replace("-", "")
+                    if outer.local_only and req_uuid != outer.uuid_str.replace("-", ""):
+                        self.send_response(404)
+                        self.end_headers()
+                        return
                     raw_id = req_uuid or outer.uuid_str.replace("-", "")
                     tex_data = {
                         "timestamp": int(time.time() * 1000),
@@ -1111,6 +1232,8 @@ class LocalSkinServer:
                             }
                         },
                     }
+                    if outer.cape_bytes:
+                        tex_data["textures"]["CAPE"] = {"url": f"http://127.0.0.1:{outer.port}/capes/{outer.cape_hash}.png"}
                     tex_b64 = base64.b64encode(json.dumps(tex_data).encode("utf-8")).decode("ascii")
                     profile = {
                         "id": raw_id,
@@ -1134,6 +1257,18 @@ class LocalSkinServer:
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                    return
+
+                if p.startswith("/capes/"):
+                    if outer.cape_bytes and p == f"/capes/{outer.cape_hash}.png":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/png")
+                        self.send_header("Content-Length", str(len(outer.cape_bytes)))
+                        self.end_headers()
+                        self.wfile.write(outer.cape_bytes)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
                     return
 
                 if p.startswith("/textures") or p.endswith(".png"):
@@ -1163,6 +1298,10 @@ class LocalSkinServer:
                             return
 
                     # 2. Other player skins on multiplayer server
+                    if outer.local_only:
+                        self.send_response(404)
+                        self.end_headers()
+                        return
                     req_clean = req_name.lower()
 
                     # Check negative cache to prevent stalling server on non-existent usernames
@@ -1272,6 +1411,8 @@ def prepare_skin_launch(
     game_dir: Path | str,
     minecraft_dir: Path | str,
     is_online: bool = True,
+    local_only: bool = False,
+    account_id: str = "",
 ) -> tuple[str, list[str], LocalSkinServer | None]:
     """Prepares the skin environment for Minecraft launch.
     Returns: (active_uuid, jvm_arguments, local_skin_server_instance)
@@ -1288,6 +1429,26 @@ def prepare_skin_launch(
     active_uuid = offline_uuid
     jvm_args: list[str] = []
     local_server: LocalSkinServer | None = None
+
+    if local_only:
+        choice = load_offline_cosmetics(account_id)
+        if not choice["custom_path"] and not choice["cape_path"]:
+            return offline_uuid, [], None
+        bridge = ensure_skin_bridge()
+        if bridge is None or not bridge.is_file():
+            raise RuntimeError("The local skin bridge is missing. Repair the launcher to use offline skins and capes.")
+        skin_path = Path(choice["custom_path"]) if choice["custom_path"] else offline_cosmetics_dir(account_id) / f"default_{choice['model']}.png"
+        if not skin_path.is_file():
+            skin_path.parent.mkdir(parents=True, exist_ok=True)
+            skin_path.write_bytes(get_default_skin_bytes(choice["model"]))
+        local_server = LocalSkinServer(
+            clean_name, offline_uuid, skin_path, model=choice["model"], local_only=True,
+            cape_png_path=Path(choice["cape_path"]) if choice["cape_path"] else None,
+        )
+        port = local_server.start()
+        return offline_uuid, _bridge_arguments(bridge, port, clean_name, choice["model"],
+                                               local_server.skin_hash, offline_uuid,
+                                               local_server.cape_hash, local_only=True), local_server
 
     jar_path = ensure_authlib_injector()
     if not jar_path or not jar_path.is_file():
@@ -1416,11 +1577,17 @@ def prepare_skin_launch(
     # Attach wisc-skin-bridge companion agent with skin hash
     bridge_jar = ensure_skin_bridge()
     if bridge_jar and bridge_jar.is_file():
-        jvm_args.append(f"-javaagent:{bridge_jar}=port={port},user={clean_name},model={active_model},hash={skin_hash}")
-        jvm_args.append(f"-Dwiscskin.port={port}")
-        jvm_args.append(f"-Dwiscskin.user={clean_name}")
-        jvm_args.append(f"-Dwiscskin.model={active_model}")
-        jvm_args.append(f"-Dwiscskin.hash={skin_hash}")
-        jvm_args.append("-Dfabric.debug.disableClassPathIsolation=true")
+        jvm_args.extend(_bridge_arguments(bridge_jar, port, clean_name, active_model, skin_hash, active_uuid))
 
     return active_uuid, jvm_args, local_server
+
+
+def _bridge_arguments(bridge: Path, port: int, username: str, model: str, skin_hash: str,
+                      player_uuid: str, cape_hash: str = "", *, local_only: bool = False) -> list[str]:
+    return [
+        f"-javaagent:{bridge}=port={port},user={username},model={model},hash={skin_hash},"
+        f"uuid={player_uuid},cape={cape_hash},localonly={str(local_only).lower()}",
+        f"-Dwiscskin.port={port}", f"-Dwiscskin.user={username}", f"-Dwiscskin.model={model}",
+        f"-Dwiscskin.hash={skin_hash}", f"-Dwiscskin.uuid={player_uuid}", f"-Dwiscskin.cape={cape_hash}",
+        f"-Dwiscskin.localOnly={str(local_only).lower()}", "-Dfabric.debug.disableClassPathIsolation=true",
+    ]

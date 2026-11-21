@@ -121,6 +121,18 @@ class ModPlatformClient(ModrinthClient):
             raise ValueError("Modrinth returned a different content type.")
         return data
 
+    def content_project(self, project_id: str, kind: str) -> dict:
+        """Load the full, validated shader or texture pack project."""
+        if kind not in {"shader", "resourcepack"}:
+            raise ValueError("Choose shaders or texture packs.")
+        if self._is_curseforge(project_id):
+            return self.curseforge.content_project(project_id, kind)
+        project = super().project(project_id)
+        if project.get("id") != project_id or project.get("project_type") != kind:
+            raise ValueError("This project is not the requested content type.")
+        return {**project, "project_id": project_id, "provider": "modrinth",
+                "project_url": f"https://modrinth.com/{kind}/{project.get('slug') or project_id}"}
+
     def content_versions(self, project_id: str, minecraft_version: str, kind: str) -> list[dict]:
         if kind not in {"shader", "resourcepack"}:
             raise ValueError("Choose shaders or texture packs.")
