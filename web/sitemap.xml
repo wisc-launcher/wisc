@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>__SITE_URL__/</loc></url>
+  <url><loc>__SITE_URL__/download</loc></url>
+  <url><loc>__SITE_URL__/getting-started</loc></url>
+  <url><loc>__SITE_URL__/minecraft-launcher</loc></url>
+  <url><loc>__SITE_URL__/mods</loc></url>
+  <url><loc>__SITE_URL__/modpacks</loc></url>
+  <url><loc>__SITE_URL__/cosmetics</loc></url>
+  <url><loc>__SITE_URL__/multiplayer</loc></url>
+  <url><loc>__SITE_URL__/docs</loc></url>
+  <url><loc>__SITE_URL__/troubleshooting</loc></url>
+  <url><loc>__SITE_URL__/help</loc></url>
+  <url><loc>__SITE_URL__/doctor</loc></url>
+  <url><loc>__SITE_URL__/benchmarks</loc></url>
+  <url><loc>__SITE_URL__/about</loc></url>
+  <url><loc>__SITE_URL__/privacy</loc></url>
+  <url><loc>__SITE_URL__/cookies</loc></url>
+  <url><loc>__SITE_URL__/terms</loc></url>
+  <url><loc>__SITE_URL__/refunds</loc></url>
+  <url><loc>__SITE_URL__/licenses</loc></url>
+  <url><loc>__SITE_URL__/files</loc></url>
+</urlset>

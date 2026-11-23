@@ -1,8 +1,8 @@
 # Windows builds and GitHub releases
 
-GitHub Actions builds Gr8 Launcher with Flet and PyInstaller, then wraps the
+GitHub Actions builds Wisc with Flet and PyInstaller, then wraps the
 application folder in an Inno Setup installer. The executable uses an **onedir**
-bundle, and its company metadata and the installer's publisher are **Gr8 Projects**.
+bundle, and its company metadata and the installer's publisher are **Wisc**.
 Users can choose an installer or a portable ZIP; neither requires Python.
 Minecraft still requires a suitable Java runtime.
 
@@ -33,7 +33,7 @@ build files, and updated `VERSION` together. From the project folder:
 ```powershell
 Set-Content -LiteralPath VERSION -Value "2.0.1" -Encoding utf8
 git add .
-git commit -m "Release Gr8 Launcher 2.0.1"
+git commit -m "Release Wisc 2.0.1"
 git push origin main
 ```
 
@@ -44,8 +44,8 @@ Local edits and untracked files must be committed to appear in the downloads.
 Open the repository's **Actions** tab to follow the build. When it succeeds,
 the release appears under **Releases** with:
 
-- `Gr8Launcher-2.0.1-windows-x64-setup.exe`
-- `Gr8Launcher-2.0.1-windows-x64.zip`
+- `Wisc-2.0.1-windows-x64-setup.exe`
+- `Wisc-2.0.1-windows-x64.zip`
 - `SHA256SUMS.txt`
 
 Choose a new, higher version for each release. Versions use `major.minor.patch`
@@ -134,7 +134,7 @@ Older screenshot commits remain in the branch history, so later releases cannot
 change an earlier release's preview. Republishing with this workflow removes an
 old PNG attachment after the notes have been updated to the archived image.
 Reruns replace only the section between
-`<!-- gr8-launcher-preview:start -->` and `<!-- gr8-launcher-preview:end -->`;
+`<!-- wisc-preview:start -->` and `<!-- wisc-preview:end -->`;
 generated changelogs and handwritten notes outside those markers are preserved.
 Pull requests and manual preview runs capture images but do not update the README
 or publish releases.
@@ -142,11 +142,11 @@ or publish releases.
 To capture a preview locally after installing `requirements-build.txt`:
 
 ```powershell
-python tools/capture_screenshot.py --output docs/screenshots/gr8-launcher-home.png
+python tools/capture_screenshot.py --output docs/screenshots/wisc-home.png
 ```
 
 Edge or Chrome must be installed. Pass `--browser "C:\path\to\msedge.exe"` if
-auto-detection cannot find it. `docs/screenshots/gr8-launcher-home.png` remains a
+auto-detection cannot find it. `docs/screenshots/wisc-home.png` remains a
 bundled preview for offline viewing; the online README uses the generated branch.
 
 ## Build locally on Windows
@@ -169,26 +169,34 @@ If the compiler is installed in a custom location, add
 To build just the portable ZIP, use `--portable-only`; Inno Setup is then optional.
 Outputs are written to `dist/`, and temporary build files are kept in `build/`.
 
-The package includes `.assets`, the tracked `tools/gr8-skin-bridge/gr8-skin-bridge.jar`,
+The package includes `.assets`, the tracked `tools/wisc-skin-bridge/wisc-skin-bridge.jar`,
 the Flet desktop client, the Windows credential backend, and the launcher license.
 An isolated build environment keeps unrelated packages out of the downloads.
 
 The builder also compiles the standalone C# `updater.exe` with the system Windows
-.NET Framework compiler, copies it beside `Gr8Launcher.exe`, and generates
+.NET Framework compiler, copies it beside `Wisc.exe`, and generates
 `bundle-manifest.json` with the managed payload's file sizes and SHA-256 hashes.
 No additional Python runtime or .NET SDK download is needed for the helper.
 See [updater.md](updater.md) for the update flow and recovery behavior. The first
 updater-capable release must be installed manually by users of older launchers.
 
+The Wisc rename also requires one manual installation for already shipped
+Gr8 Launcher builds: their release discovery and compiled helpers only understand
+the earlier executable and archive names. Install Wisc using the existing install
+directory, or extract its full portable ZIP. Wisc's helper accepts both bundle
+inventories and both recovery formats; future Wisc releases update normally.
+Keep the installer AppId unchanged so setup reuses the previous directory and
+scope, replaces shortcuts, and removes obsolete files through the old inventory.
+
 ## Installer behavior and maintenance
 
-New installations default to `%ProgramFiles%\Gr8Launcher`, usually
-`C:\Program Files\Gr8Launcher`. The installer selects installation for all users
+New installations default to `%ProgramFiles%\Wisc`, usually
+`C:\Program Files\Wisc`. The installer selects installation for all users
 by default, which requests administrator approval. Users can also choose a
 current-user installation or a custom destination folder.
 
 Future installers remember the previous installation's scope, directory, and
-shortcut choices. For example, an installation in `D:\Games\Gr8Launcher` is
+shortcut choices. For example, an installation in `D:\Games\Wisc` is
 updated in that same folder. The destination selection page is skipped on updates;
 the ready-to-install page still shows the destination. Earlier current-user
 installations also keep their installation scope and folder when updated.
@@ -202,7 +210,7 @@ On upgrades with a previous bundle inventory, setup preserves that inventory
 before copying files. The installed helper removes obsolete managed files whose
 hashes still match the old inventory. User-added and modified files are preserved.
 
-The installer creates a Start menu shortcut in the **Gr8 Projects** group,
+The installer creates a Start menu shortcut in the **Wisc** group,
 offers a desktop shortcut, and registers an uninstaller. Launcher settings and
 Minecraft instances stay in their existing Minecraft data folders when the
 application is uninstalled.

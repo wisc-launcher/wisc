@@ -1,12 +1,12 @@
 # Shared progress
 
-The bottom progress bar stays available on every launcher page. Minecraft
-installation and repair, mod searches and details, mod downloads and file
+One shared progress bar stays available at the bottom of every launcher page.
+Minecraft launch, installation and repair, mod searches and details, mod downloads and file
 changes, skin refresh, sign-in, and version fetches use the same `ProgressHost`.
-Its navy/gold styling matches the existing download footer.
-The status and detail text above the bar appear only on Home. Other pages keep
-the bar without the text row, including during active work. Returning to Home
-restores the current task or idle status.
+Its colors follow the selected classic theme. Home uses this same bar for
+Minecraft instead of a separate launch bar. Foreground operations show status,
+percentage, and detail text above the bar; idle and page-loading work keep only
+the bar. Navigation preserves the current operation and measured progress.
 
 Unknown totals use an animated bar without a percentage. Measured work uses a
 filled bar; mod downloads report bytes across the complete batch, including
@@ -21,8 +21,8 @@ Measured fills animate on the client over 240 ms, retargeting smoothly when new
 counts arrive. Progress snapshots retain the measured value regardless of how
 often callbacks or UI reads occur. Returning to idle cancels the animation.
 While measured work is incomplete, a 90px feathered gradient beam moves from left
-to right inside the gold fill, including when counts pause. It reuses v1.2.0's
-gradient shape with a navy tint. Each sweep animates on the client; the launcher
+to right inside the accent fill, including when counts pause. It reuses v1.2.0's
+gradient shape with the selected background tint. Each sweep animates on the client; the launcher
 only resets it between sweeps. Unknown totals, completion, idle, and shutdown
 stop the shimmer.
 
@@ -49,14 +49,14 @@ Existing Minecraft cancellation controls retain their behavior.
 
 ## Using the API
 
-Pass the host to a UI component through its constructor. `main.py` also exposes
-the current host through `state.progress_state["host"]` for shared integrations.
+Pass the host to a UI component through its constructor. The application owns
+one host at `LegacyFeatures.progress` and passes it to each page that needs it.
 Use the context manager so exceptions and cancellation release the operation:
 
 ```python
 import asyncio
 
-from ui_progress import track_progress
+from wisc.ui.progress import track_progress
 
 async def refresh_skin(progress_host):
     with track_progress(progress_host, "Refreshing skin...", priority=50):
@@ -92,18 +92,12 @@ are not included in a clone or required by the GitHub build.
 
 ```powershell
 python -B -m unittest temp.test_ui_progress temp.test_ui_mods temp.test_mod_services
-python -B temp/check_progress_motion.py
-python -B temp/check_progress_motion.py --shimmer-only
-py -3.14 -B temp/check_mods_ui.py --progress-only
+python -B tools/capture_screenshot.py --route mods --output temp/progress-mods.png
 ```
 
-The browser check uses isolated data and mocked downloads/skin responses. It
-verifies [search loading](screenshots/gr8-launcher-progress-fetch.png),
-[measured downloads](screenshots/gr8-launcher-progress-download.png),
-[a larger window](screenshots/gr8-launcher-progress-download-large.png),
-[navigation during a download](screenshots/gr8-launcher-progress-navigation.png),
-[idle restoration](screenshots/gr8-launcher-progress-idle.png), and
-[skin refresh](screenshots/gr8-launcher-progress-skin.png).
+Local screenshots use isolated sample data in the real Flet web client. Progress
+previews cover search loading, measured downloads, larger windows, navigation
+during a download, idle restoration, and skin refresh.
 The motion check samples rendered fill positions at 1100x650 and 1366x768,
 including interrupted transitions, unknown progress, and immediate idle reset.
 The shimmer check verifies moving beams at a steady percentage, clipping to the

@@ -1,0 +1,14 @@
+{
+  "name": "wisc-launcher-website",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build_web.mjs",
+    "dev": "npm run build && node tools/serve_web.mjs",
+    "preview": "node tools/serve_web.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

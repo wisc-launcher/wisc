@@ -16,17 +16,18 @@
 [Setup]
 ; "{{" escapes a literal "{". Keep this AppId unchanged across releases.
 AppId={{449A7BDC-D374-4AAB-8D31-D699214AC088}
-AppName=Gr8 Launcher
+AppName=Wisc
 AppVersion={#AppVersion}
-AppPublisher=Gr8 Projects
-AppPublisherURL=https://github.com/jaydeeppatil23/Gr8Launcher
-AppSupportURL=https://github.com/jaydeeppatil23/Gr8Launcher/issues
-AppUpdatesURL=https://github.com/jaydeeppatil23/Gr8Launcher/releases
+AppPublisher=Wisc
+AppPublisherURL=https://github.com/wisc-launcher/wisc
+AppSupportURL=https://github.com/wisc-launcher/wisc/issues
+AppUpdatesURL=https://github.com/wisc-launcher/wisc/releases
 VersionInfoVersion={#NumericVersion}.0
-VersionInfoCompany=Gr8 Projects
-VersionInfoProductName=Gr8 Launcher
-DefaultDirName={autopf}\Gr8Launcher
-DefaultGroupName=Gr8 Projects
+VersionInfoCompany=Wisc
+VersionInfoProductName=Wisc
+DefaultDirName={autopf}\Wisc
+DefaultGroupName=Wisc
+UsePreviousGroup=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
@@ -39,10 +40,10 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 LicenseFile={#ProjectRoot}\LICENSE
-SetupIconFile={#ProjectRoot}\.assets\icons\gr8_icon.ico
-UninstallDisplayIcon={app}\Gr8Launcher.exe
+SetupIconFile={#ProjectRoot}\.assets\icons\wisc.ico
+UninstallDisplayIcon={app}\Wisc.exe
 OutputDir={#OutputDir}
-OutputBaseFilename=Gr8Launcher-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=Wisc-{#AppVersion}-windows-x64-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -56,15 +57,32 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "{#PackageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\Gr8 Launcher"; Filename: "{app}\Gr8Launcher.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\Gr8 Launcher"; Filename: "{app}\Gr8Launcher.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\Wisc"; Filename: "{app}\Wisc.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\Wisc"; Filename: "{app}\Wisc.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\Gr8Launcher.exe"; Description: "Launch Gr8 Launcher"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Wisc.exe"; Description: "Launch Wisc"; Flags: nowait postinstall skipifsilent
 
 [Code]
 var
   OldBundleInventory: String;
+
+procedure RemoveLegacyShortcut(const ShortcutPath: String);
+var
+  Shell, Shortcut: Variant;
+begin
+  if not FileExists(ShortcutPath) then
+    Exit;
+  try
+    Shell := CreateOleObject('WScript.Shell');
+    Shortcut := Shell.CreateShortcut(ShortcutPath);
+    { Only remove a shortcut belonging to this same installation. }
+    if CompareText(Shortcut.TargetPath, ExpandConstant('{app}\Gr8Launcher.exe')) = 0 then
+      DeleteFile(ShortcutPath);
+  except
+    { An inaccessible or edited shortcut can be left in place safely. }
+  end;
+end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
@@ -92,5 +110,11 @@ begin
       RaiseException('Could not finish cleaning up the previous launcher bundle. Run setup again to repair it.');
     if CleanupExitCode <> 0 then
       RaiseException('The launcher bundle needs repair. Run setup again before launching.');
+  end;
+  if CurStep = ssPostInstall then
+  begin
+    RemoveLegacyShortcut(ExpandConstant('{autodesktop}\Gr8 Launcher.lnk'));
+    RemoveLegacyShortcut(ExpandConstant('{autoprograms}\Gr8 Projects\Gr8 Launcher.lnk'));
+    RemoveDir(ExpandConstant('{autoprograms}\Gr8 Projects'));
   end;
 end;

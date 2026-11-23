@@ -6,11 +6,19 @@ rollback, interrupted recovery, and helper rendering have local validation.
 Installed upgrades use Inno Setup and require the installed-copy validation
 described below. This feature has not been published in a release.
 
+Current packages use `Wisc.exe` and a `Wisc/` ZIP root. The helper also accepts
+legacy Gr8 inventories and recovery records, preserving the same integrity,
+process, path, and rollback checks. Archives must contain one recognized root
+and one matching launcher executable. New update caches use
+`%LOCALAPPDATA%\Wisc\updates`; an existing Gr8 cache remains in use for recovery.
+Already shipped Gr8 launchers require one manual Wisc installation because their
+release discovery and compiled helper only recognize the earlier names.
+
 ---
 
 ## 1. Goal and Scope
 
-When a newer Gr8 Launcher release is published on GitHub, discover it, notify
+When a newer Wisc release is published on GitHub, discover it, notify
 the user, download and verify it in the background after consent, and coordinate
 application replacement and relaunch.
 
@@ -26,20 +34,20 @@ application replacement and relaunch.
 | File or Component | Verified Behavior & Constraints |
 | --- | --- |
 | [`VERSION`](../VERSION) | Single source of truth for release version (e.g. `2.3.0`). |
-| [`tools/build_windows.py`](../tools/build_windows.py) | Builds Flet/PyInstaller `onedir` package, writes `VERSION` alongside `Gr8Launcher.exe`, and emits portable `.zip`, setup `.exe`, and `SHA256SUMS.txt`. |
+| [`tools/build_windows.py`](../tools/build_windows.py) | Builds Flet/PyInstaller `onedir` package, writes `VERSION` alongside `Wisc.exe`, and emits portable `.zip`, setup `.exe`, and `SHA256SUMS.txt`. |
 | [`packaging/windows.iss`](../packaging/windows.iss) | Fixed AppId `{449A7BDC-D374-4AAB-8D31-D699214AC088}`; the source escapes the opening brace as `{{`. Remembers installation scope, directory, and tasks. Sets `CloseApplications=yes`, `RestartApplications=no`, and `skipifsilent` on post-install launch. All-user setup requires elevation. |
-| [`storage.py`](../storage.py) | Resolves the Minecraft data directory and stores settings in its `gr8launcher/settings.json`, normally `%APPDATA%\.minecraft\gr8launcher\settings.json` on Windows. Keys are explicitly validated on load. |
-| [`ui_toasts.py`](../ui_toasts.py) | `ToastHost` provides non-blocking action toasts (e.g. "Update Available", "Update Ready"). |
-| [`ui_progress.py`](../ui_progress.py) | Centralized progress management for concurrent background tasks. |
-| [`main.py`](../main.py) | Owns startup sequence, settings views, and window lifecycle. |
-| [`state.py`](../state.py), [`ui_mods.py`](../ui_mods.py) | `launcher_log_state["running"]` covers launch, installation, repair, and game activity. `ModsPage.busy` includes mod and modpack mutations. |
-| [`launcher_updates.py`](../launcher_updates.py), [`ui_updates.py`](../ui_updates.py) | Implement release discovery, verified preparation, source/mock guards, the About card, update dialog, progress, and helper handoff. |
+| [`wisc/core/storage.py`](../wisc/core/storage.py) | Resolves the Minecraft data directory and stores settings in its `wisc/settings.json`, normally `%APPDATA%\.minecraft\wisc\settings.json` on Windows. Keys are explicitly validated on load. |
+| [`wisc/ui/toasts.py`](../wisc/ui/toasts.py) | `ToastHost` provides non-blocking action toasts (e.g. "Update Available", "Update Ready"). |
+| [`wisc/ui/progress.py`](../wisc/ui/progress.py) | Centralized progress management for concurrent background tasks. |
+| [`main.py`](../main.py), [`wisc/app.py`](../wisc/app.py) | Run the startup guard and own page orchestration, settings views, and window lifecycle. |
+| [`wisc/core/state.py`](../wisc/core/state.py), [`wisc/ui/mods.py`](../wisc/ui/mods.py) | `launcher_log_state["running"]` covers launch, installation, repair, and game activity. `ModsPage.busy` includes mod and modpack mutations. |
+| [`wisc/services/updates.py`](../wisc/services/updates.py), [`wisc/ui/updates.py`](../wisc/ui/updates.py) | Implement release discovery, verified preparation, source/mock guards, the About card, update dialog, progress, and helper handoff. |
 | [`tools/updater/Program.cs`](../tools/updater/Program.cs), [`tools/build_updater.py`](../tools/build_updater.py) | Compile and run the standalone `updater.exe` with a themed progress window, target lock, file journal, startup acknowledgement, and recovery. |
 
 The current PyInstaller 6 `onedir` layout uses `_internal/` for dependencies and
 bundled resources, in addition to the root executable and `VERSION`. Actual
 package contents must be inventoried during the build; updating only root DLLs
-or `Gr8Launcher.exe` is insufficient. Flet also starts a desktop client process.
+or `Wisc.exe` is insufficient. Flet also starts a desktop client process.
 
 ---
 
@@ -58,14 +66,14 @@ IS_PACKAGED: bool = getattr(sys, "frozen", False)
 - Automatic application replacement additionally requires Windows x64, a desktop session, a valid application root, and a supported installation record. Frozen detection alone does not authorize replacement of arbitrary directories.
 - **When running from source (`python main.py`):**
   - Self-updating and file replacement are **strictly disabled**.
-  - Settings / About tab displays: `Running from source (v<VERSION> - dev)`.
+  - Options / Updates page displays: `Running from source (v<VERSION> - dev)`.
   - Manual discovery remains available, but downloading executable updates and applying them are disabled. Enforce this in the service as well as the UI.
 - **Simulation / Mock Mode for UI testing:**
-  - `GR8_UPDATE_MOCK=1` uses simulated release, progress, cancellation, and result records. It must never invoke setup, write to an installation, terminate real processes, or restart the system. Mock cache state is separate from real state.
+  - `WISC_UPDATE_MOCK=1` uses simulated release, progress, cancellation, and result records. It must never invoke setup, write to an installation, terminate real processes, or restart the system. Mock cache state is separate from real state.
 
 ### 3.2 Decoupled, Pure-Python Core
 
-- `launcher_updates.py` contains all version parsing, GitHub Releases API communication, ETag caching, checksum verification, and installation discovery.
+- `wisc/services/updates.py` contains all version parsing, GitHub Releases API communication, ETag caching, checksum verification, and installation discovery.
 - **No Flet dependency:** Use Python standard libraries, including `urllib.request`, `hashlib`, `json`, `zipfile`, `pathlib`, `subprocess`, and Windows-specific helpers such as `winreg`. Run blocking I/O in workers and deliver progress to the UI loop through callbacks.
 - **Testing hygiene:** All unit tests for updater logic reside in the local-only, git-ignored `temp/` folder (e.g. `temp/test_launcher_updates.py`), adhering to repository testing guidelines.
 
@@ -74,7 +82,7 @@ IS_PACKAGED: bool = getattr(sys, "frozen", False)
 Use this operation layout, with a unique identifier for each download/apply attempt:
 
 ```text
-%LOCALAPPDATA%\Gr8Launcher\updates\
+%LOCALAPPDATA%\Wisc\updates\
     discovery.json
     installations\<installation_id>\state.json
     operations\<operation_id>\
@@ -97,7 +105,7 @@ locks, and results must remain specific to the target installation.
 Downloads and helper files stay in the user cache. Portable staging and backups
 are an explicit exception: place them in an operation-specific directory beside
 the application folder on the same volume, such as
-`<app_parent>/.gr8-update-<operation_id>/`. This enables same-volume file moves
+`<app_parent>/.wisc-update-<operation_id>/`. This enables same-volume file moves
 without putting temporary files inside the payload being replaced.
 
 Check write access and space for both cache and staging before shutdown. If the
@@ -114,15 +122,18 @@ or modify the repository, `.assets/`, `build/`, or `dist/`.
 Query GitHub's public releases endpoint:
 
 ```text
-GET https://api.github.com/repos/jaydeeppatil23/Gr8Launcher/releases/latest
+GET https://api.github.com/repos/wisc-launcher/wisc/releases/latest
 ```
 
-- **Headers:** Send a distinct `User-Agent: Gr8Launcher-Updater/<version>` and `Accept: application/vnd.github+json`.
+Release links from the former `jaydeeppatil23/Gr8Launcher` repository name remain
+valid for cached releases and redirects.
+
+- **Headers:** Send a distinct `User-Agent: Wisc-Updater/<version>` and `Accept: application/vnd.github+json`.
 - **ETag caching:** Store the ETag and complete validated release record together, and send `If-None-Match`. On `304 Not Modified`, reuse that record. If it is missing or invalid, repeat once without the ETag. Unauthenticated conditional requests do not guarantee zero rate-limit usage; no GitHub token is embedded in the launcher.
 - **Frequency:**
   - Evaluate an automatic check asynchronously 5 seconds after UI startup. Fetch only if the preference is enabled, the last successful check is at least 6 hours old, and no backoff is active.
   - Periodic check interval: every 6 hours if the launcher remains open.
-  - Manual check button in Settings > About bypasses the time throttle while respecting backoff headers if rate-limited.
+  - Manual check button in Options > Updates bypasses the time throttle while respecting backoff headers if rate-limited.
 
 Use bounded connect/read timeouts. Honor `Retry-After` and rate-limit reset
 headers, with bounded backoff for transient failures. Do not run a tight retry
@@ -142,8 +153,8 @@ than "Up to date." Stale cached information must be labeled as such.
 
 For a target release `X.Y.Z`, match exact asset names:
 
-- **Installer:** `Gr8Launcher-X.Y.Z-windows-x64-setup.exe`
-- **Portable:** `Gr8Launcher-X.Y.Z-windows-x64.zip`
+- **Installer:** `Wisc-X.Y.Z-windows-x64-setup.exe`
+- **Portable:** `Wisc-X.Y.Z-windows-x64.zip`
 - **Checksums:** `SHA256SUMS.txt`
 
 Never match arbitrary source archives or unrelated release attachments.
@@ -160,7 +171,7 @@ release, not another lookup of "latest."
 
 1. **Streaming Download:**
    - Stream to the operation's `package.part`, never a shared `<filename>.part`.
-   - Update `ui_progress.py` with bytes received, total size, and download rate.
+   - Update `wisc/ui/progress.py` with bytes received, total size, and download rate.
    - Cancellation is cooperative and bounded by the network read timeout. Close streams before deleting the operation's partial file. Apply a total deadline, size limits, and disk-space checks.
 2. **Checksum Verification:**
    - Download `SHA256SUMS.txt` from the pinned release and checksum asset.
@@ -170,8 +181,9 @@ release, not another lookup of "latest."
 3. **Failure Handling:**
    - If checksum mismatch occurs, delete corrupted `.part` file, log the error, and notify the user with a Retry option. Never execute unverified binaries.
 
-Accept HTTPS URLs from the fixed repository's release infrastructure and validate
-redirects against supported GitHub asset hosts. Do not execute commands from
+Accept HTTPS release URLs from `wisc-launcher/wisc` and its known former name,
+`wisc-launcher/wisc`, and validate redirects against supported GitHub
+asset hosts. Do not execute commands from
 release metadata. Workflow reruns can replace assets: on identity changes or a
 checksum mismatch, discard the attempt and rediscover rather than mixing releases.
 The helper rechecks the expected hash immediately before application and prevents
@@ -198,7 +210,7 @@ python -B tools/build_updater.py
 ```
 
 The result is `build/updater/updater.exe`. The Windows package builder copies it
-beside `Gr8Launcher.exe` and inventories it before generating release archives.
+beside `Wisc.exe` and inventories it before generating release archives.
 The launcher copies its installed helper into an operation directory outside
 the application root before handoff. The helper must match the old bundle's hash.
 
@@ -227,7 +239,7 @@ The launcher detects its own installation mode at runtime:
 1. **Installed Copy:** Query Windows Registry for Inno Setup AppId:
    - `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{449A7BDC-D374-4AAB-8D31-D699214AC088}_is1`
    - `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\{449A7BDC-D374-4AAB-8D31-D699214AC088}_is1`
-   - Check if `InstallLocation` matches the directory of the running `Gr8Launcher.exe`.
+   - Check if `InstallLocation` matches the directory of the running `Wisc.exe`.
    - Use the relevant registry view and canonical case-insensitive paths. Retain HKCU/HKLM scope in the installation record; another registered copy does not classify this executable as installed.
 2. **Portable Copy:** No matching registration, with a valid packaged application root and bundle inventory. Treat registry access errors or ambiguous records as unknown, not automatically portable.
 
@@ -235,7 +247,7 @@ The launcher detects its own installation mode at runtime:
 
 On Restart now, gate application on all of the following:
 
-- `state.launcher_log_state["running"]` is false, covering installation, repair, launch, and game activity.
+- `wisc.core.state.launcher_log_state["running"]` is false, covering installation, repair, launch, and game activity.
 - `mods_content.busy` is false, covering mod and modpack mutations.
 - No competing updater or other launcher copy is using the same installation.
 
@@ -324,7 +336,7 @@ Never remove the entire application folder or merge an incomplete runtime into i
 
 Packaging generates `bundle-manifest.json`. It contains a schema version,
 application version, and relative path, size, and SHA-256 for every managed payload
-file, excluding the manifest itself. Include `Gr8Launcher.exe`, `VERSION`,
+file, excluding the manifest itself. Include `Wisc.exe`, `VERSION`,
 `LICENSE`, `README.md`, all `_internal/` contents, and any other actual bundled
 files. Inventory the final build output rather than assuming where resources live.
 This inventory is for file ownership and integrity, not a hosted update service.
@@ -337,7 +349,7 @@ compatible or reject releases the installed updater cannot apply.
 
 Before extracting the verified ZIP, validate every entry:
 
-- Exactly one expected `Gr8Launcher/` root; no absolute, drive-qualified, UNC, parent-traversal, alternate-stream, or reserved Windows paths.
+- Exactly one expected `Wisc/` root; no absolute, drive-qualified, UNC, parent-traversal, alternate-stream, or reserved Windows paths.
 - No links, reparse-point traversal, case-insensitive duplicate paths, or file/directory collisions. Resolve destinations inside fresh staging and reject existing redirected directories.
 - Bounded file count, expanded size, and compression ratio, with space for staging and backup on the target volume.
 - Every extracted file matches the new inventory, with no unlisted payload except the manifest. Validate the staged `VERSION` against the selected release; executable existence alone is not enough.
@@ -438,8 +450,8 @@ future incompatible migration needs a separate recovery design.
                            [Cleanup]    [Rollback / Repair]
 ```
 
-1. **Non-Intrusive Notifications:** Use the existing toast's single action button for View update or Restart now. Put Later in the dialog/banner; do not assume the shared toast supports two actions. Expired toasts leave update status accessible in Settings > About.
-2. **Settings > About Panel Integration:**
+1. **Non-Intrusive Notifications:** Use the existing toast's single action button for View update or Restart now. Put Later in the dialog/banner; do not assume the shared toast supports two actions. Expired toasts leave update status accessible in Options > Updates.
+2. **Options > Updates Panel Integration:**
    - Displays current version dynamically loaded from `VERSION`.
    - "Check for Updates" button with loading spinner and status feedback ("Checking...", "Up to date", "Update available: v2.4.0").
    - "What's New" release notes viewer using supported Markdown or text. Do not execute remote HTML; constrain link actions to opening validated web URLs.
@@ -462,7 +474,7 @@ Update preferences and operational state are stored cleanly in existing storage 
 
 Operational state is kept separate from `settings.json` so that update metadata caching never pollutes Minecraft profile settings or roaming profiles.
 
-Add both preferences to `storage.load_settings()` validation and defaults. Write
+Add both preferences to `wisc.core.storage.load_settings()` validation and defaults. Write
 cache, handoff, journal, acknowledgement, and result records atomically; flush
 durable transaction changes before proceeding. Validate all records on read.
 Malformed or unknown schemas disable application and preserve recovery files.
@@ -491,7 +503,7 @@ backups; preserve existing credential storage and notification redaction.
 
 ## 11. Implementation Sequence
 
-1. **Phase 1: Core Engine (`launcher_updates.py`)**
+1. **Phase 1: Core Engine (`wisc/services/updates.py`)**
    - Implement version comparison logic (`compare_versions`, `parse_version`).
    - Implement GitHub API client with ETag headers and timeout handling.
    - Implement package download streamer with SHA-256 verification and cancellation.
@@ -499,7 +511,7 @@ backups; preserve existing credential storage and notification redaction.
    - Add focused local tests for semantic ordering, malformed/incomplete releases, missing current version, 304 without cache, backoff, cancellation, and checksum rejection.
 2. **Phase 2: UI & Settings Integration**
    - Replace hardcoded version in [`main.py`](../main.py#L5300) with dynamic version loader.
-   - Add update card, manual "Check for Updates" button, and status indicator in Settings > About.
+   - Add update card, manual "Check for Updates" button, and status indicator in Options > Updates.
    - Connect non-blocking startup check and `ToastHost` notifications.
    - Add safe developer guard (`IS_PACKAGED`) and mock mode toggle.
 3. **Phase 3: Helper Script & Packaging**

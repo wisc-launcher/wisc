@@ -27,8 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PENDING = "docs/changes/unreleased"
 ARCHIVE = "docs/changes/releases"
 CATEGORIES = ("Added", "Changed", "Fixed", "Removed", "Security")
-START = "<!-- gr8-release-notes:start -->"
-END = "<!-- gr8-release-notes:end -->"
+START = "<!-- wisc-release-notes:start -->"
+END = "<!-- wisc-release-notes:end -->"
+LEGACY_START = "<!-- gr8-release-notes:start -->"
+LEGACY_END = "<!-- gr8-release-notes:end -->"
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\.md")
 
 
@@ -48,7 +50,7 @@ def parse_fragment(text: str, name: str) -> dict[str, list[str]]:
         elif line.strip():
             if current is None or (not line.startswith("- ") and not line.startswith("  ")):
                 raise ValueError(f"{name}: write bullets under a ### change category.")
-            if START in line or END in line:
+            if any(marker in line for marker in (START, END, LEGACY_START, LEGACY_END)):
                 raise ValueError(f"{name}: generated release markers are not allowed in fragments.")
             sections[current].append(line.rstrip())
     if not any(any(line.startswith("- ") and line[2:].strip() for line in lines) for lines in sections.values()):
@@ -144,6 +146,7 @@ def render(snapshot: dict) -> str:
 def merge_body(body: str, notes: str) -> str:
     if not notes:
         return body
+    body = body.replace(LEGACY_START, START).replace(LEGACY_END, END)
     if body.count(START) != body.count(END) or body.count(START) > 1:
         raise ValueError("Existing release notes have incomplete or duplicate managed markers.")
     if START in body:
@@ -204,7 +207,7 @@ def archive(api: GitHubAPI, snapshot: dict, tag: str, branch: str = "main") -> b
         print("Keeping pending notes: the source branch no longer contains the built commit.")
         return False
     date = str(release.get("published_at") or "")[:10]
-    archived = (f"# Gr8 Launcher v{snapshot['version']}\n\n"
+    archived = (f"# Wisc v{snapshot['version']}\n\n"
                 f"Released: {date}\n\nSource commit: `{snapshot['commit']}`\n\n" + notes)
     archive_path = f"{ARCHIVE}/{snapshot['version']}.md"
     existing = content_at(api, archive_path, head)

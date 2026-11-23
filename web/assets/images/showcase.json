@@ -1,0 +1,14 @@
+{
+  "screens": [
+    "/assets/images/home.png",
+    "/assets/images/library.png",
+    "/assets/images/skins.png"
+  ],
+  "mods": {
+    "Fabric API": "/assets/images/embedded-4.png",
+    "FerriteCore": "/assets/images/embedded-5.png",
+    "Iris": "/assets/images/embedded-6.png",
+    "labymod4": "/assets/images/embedded-7.png",
+    "Litematica": "/assets/images/embedded-8.png"
+  }
+}

@@ -1,12 +1,54 @@
-some details abt the theme/appearance of the launcher:
-this is a minimal minecraft launcher.
-the main colors are "#f5de9a"-primary(usually for texts or buttons) "#182842"-secondary(usually for bg).
-all elements are either sharp or have a simple rounded rectangle style having radius of 5px.
-usually there are no hover colors to the interactive elements.
-containers/spaces have no bg color for most of the time, but when they do, they use the black_26.
-dropdowns always have a black_26 background, 5px corners and a 48px height, with a gold label and chevron. use the shared AcrylicSelector so this is the default everywhere. menus open below the field at the same width and keep the existing navy acrylic blur. do not add an outline or hover fill by default. use one control per filter.
-animations are minimal which includes fade in and fade out simultaneously.
-there are no borders to elements except for some rare cases.
-the ui looks modern and clean.
-custom font "ps" for major elements(most of the time) and normal system font for other elements but making sure that it looks good.
-custom icons/assets(most of the time) if they are not there, user provides them. he will decide- use flet lib icons or custom.
+The launcher keeps its restored classic structure with a
+Cubeon-inspired artwork background and dark glass shell.
+
+Keep its top navigation, Wisc logo and title, Home launch controls, library cards,
+compact profile rows, skin preview, and Options dashboard. Bundled official
+Minecraft artwork fills the whole window and follows the selected launch
+profile across every page and theme switch. Restore the saved selection at
+startup. Custom profile artwork overrides update covers; legacy and unknown
+versions share the Java Edition cover. Do not restore a separate Home banner.
+
+Chrome and page elements use borderless near-black glass and light labels. The fixed
+title bar is 52px high and spans the window edge to edge, with no outer margin
+or rounding.
+Other shared surfaces keep 14px rounded corners. Dark gradients fade inward
+from all four edges of the artwork, leaving the center clear.
+Keep the version artwork crisp behind Home; frost the full window background
+for dense feature pages, including the margins and footer. Reuse pre-blurred covers on fixed shell
+surfaces, including the same window vignette, and clip their background layer
+without clipping foreground dialogs.
+The Home launch panel is transparent, with no backdrop blur or fill, while keeping its existing layout.
+
+The selected theme comes from wisc.core.themes.THEMES; Earth 2 is the
+default. It supplies accents for primary actions, selection, and keyboard focus.
+wisc.ui.glass supplies a consistent dark translucent palette across all themes.
+Page cards, profile rows, skin panels, settings, dialogs, notifications, and
+library captions use rounded frosted glass while keeping their existing layouts.
+Inputs and secondary buttons use matching translucent fills. Resting surfaces
+have no visible outlines; keep accent selection and focus feedback visible.
+
+Current mods, modpacks, updater dialogs, notifications, and progress inherit the
+glass palette and selected accents through wisc.ui.theme.apply_legacy_theme. Keep their useful
+behavior integrated into the classic layout. Use bundled Pixelify Sans for the
+launcher title and Home edition label, and system fonts for page headings, profile
+names, controls, and dense details. Retain all bundled font licenses.
+
+Use the classic 12px cards with dark glass fills, 8px buttons and
+artwork corners, and visible hover/focus feedback. Page headings are 24px and
+share the classic 28px horizontal and 20px top inset. Profiles, mod selection,
+mods, packs, details, reviews, and Updates reuse these shapes and text styles.
+
+Use AcrylicSelector for filters and LegacySelector for the classic forms.
+Closed fields are 48px high with 5px corners, light labels and chevrons, and
+theme accents for selected items.
+Menus remain acrylic, anchored below the field at the same width, with one
+control per filter. Keep keyboard access and selection feedback usable.
+
+Retained controls keep semantic theme roles, including transparent tints and
+button styles. Equal hex values must not cause backgrounds to inherit button
+text colors after a theme switch. Keep the selected profile, query, filters,
+and scroll position across navigation, and start scans after mounting a page.
+
+Keep transitions brief and interruptible. Retain the shared dialog, toast,
+progress, scrolling, and drag-state handling. Check 1100x650 and larger windows;
+the title bar must remain usable and long pages must scroll.

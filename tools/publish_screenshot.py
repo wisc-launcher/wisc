@@ -15,9 +15,11 @@ from urllib.request import Request, urlopen
 
 PREVIEW_BRANCH = "launcher-preview"
 RELEASE_PREVIEW_BRANCH = "release-previews"
-IMAGE_NAME = "gr8-launcher-home.png"
-START_MARKER = "<!-- gr8-launcher-preview:start -->"
-END_MARKER = "<!-- gr8-launcher-preview:end -->"
+IMAGE_NAME = "wisc-home.png"
+START_MARKER = "<!-- wisc-preview:start -->"
+END_MARKER = "<!-- wisc-preview:end -->"
+LEGACY_START_MARKER = "<!-- gr8-launcher-preview:start -->"
+LEGACY_END_MARKER = "<!-- gr8-launcher-preview:end -->"
 
 
 class GitHubAPI:
@@ -38,7 +40,7 @@ class GitHubAPI:
                                    "Accept": "application/vnd.github+json",
                                    "Content-Type": "application/json",
                                    "X-GitHub-Api-Version": "2022-11-28",
-                                   "User-Agent": "Gr8Launcher-screenshot-workflow"})
+                                   "User-Agent": "Wisc-screenshot-workflow"})
         try:
             with urlopen(request, timeout=30) as response:
                 if response.status == 204:
@@ -52,9 +54,10 @@ class GitHubAPI:
 
 
 def update_release_notes(body: str, image_url: str) -> str:
+    body = body.replace(LEGACY_START_MARKER, START_MARKER).replace(LEGACY_END_MARKER, END_MARKER)
     block = (
         f"{START_MARKER}\n## Launcher preview\n\n"
-        f"![Gr8 Launcher home screen]({image_url})\n\n"
+        f"![Wisc home screen]({image_url})\n\n"
         "Captured from this release's source with example profiles.\n"
         f"{END_MARKER}"
     )

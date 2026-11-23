@@ -41,16 +41,22 @@ def find_browser(explicit: str | None) -> Path:
     raise RuntimeError("Install Edge or Chrome, or pass --browser PATH.")
 
 
-def serve_preview(directory: Path, port: int) -> None:
-    source = directory / "source"
+def copy_preview_source(source: Path) -> None:
+    """Copy release inputs without local tests, backups, or runtime caches."""
     source.mkdir()
-    for module in PROJECT_ROOT.glob("*.py"):
-        shutil.copy2(module, source / module.name)
+    shutil.copy2(PROJECT_ROOT / "main.py", source / "main.py")
+    shutil.copytree(PROJECT_ROOT / "wisc", source / "wisc",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     # The About view resolves the version beside the copied application source.
     if (PROJECT_ROOT / "VERSION").is_file():
         shutil.copy2(PROJECT_ROOT / "VERSION", source / "VERSION")
     shutil.copytree(PROJECT_ROOT / ".assets", source / ".assets",
                     ignore=shutil.ignore_patterns("cache", "__pycache__"))
+
+
+def serve_preview(directory: Path, port: int, route: str = "home") -> None:
+    source = directory / "source"
+    copy_preview_source(source)
     sys.path.insert(0, str(source))
     # Patch the data directory before importing any launcher modules. The copied
     # source also prevents legacy .data migration from touching local settings.
@@ -58,7 +64,7 @@ def serve_preview(directory: Path, port: int) -> None:
     minecraft_root = directory / "minecraft"
     minecraft_launcher_lib.utils.get_minecraft_directory = lambda: str(minecraft_root)
 
-    import storage
+    from wisc.core import storage
     assert storage.DATA_DIR.resolve().is_relative_to(directory.resolve())
     if not storage.save_accounts({
         "active_account_id": "screenshot-player",
@@ -77,21 +83,35 @@ def serve_preview(directory: Path, port: int) -> None:
          "game_directory": str(minecraft_root / "instances" / "Fabric Adventure"),
          "icon": "icon_blocks/diamond_ore.png"},
     ]
+    for profile in profiles:
+        profile["is_instance"] = True
+        Path(profile["game_directory"]).mkdir(parents=True)
     if not storage.save_installations(profiles, latest_release_id="1.21.4"):
         raise RuntimeError("Could not create screenshot profiles.")
     if not storage.save_settings({**storage.DEFAULT_SETTINGS, "discord_rpc": False,
-                                  "enable_orbs": False, "enable_head_tracking": False,
-                                  "performance_mode": True}):
+                                  "enable_orbs": False, "onboarding_completed": True}):
         raise RuntimeError("Could not create screenshot settings.")
 
-    import main as launcher_ui
+    from wisc import app as launcher_ui
     import flet as ft
     import uvicorn
     # Use the same bundled assets as the desktop app, with web-relative paths.
     os.chdir(source / ".assets")
     launcher_ui.ASSETS_DIR = Path(".")
     launcher_ui.get_latest_release_version = lambda: ("1.21.4", True)
+    launcher_ui.get_version_catalog = lambda: (
+        [{"id": "1.21.4", "type": "release"}, {"id": "1.21.1", "type": "release"}], "1.21.4", True)
     launcher_ui.check_internet_connection = lambda *args, **kwargs: True
+    from wisc.services import instances as launcher_services
+    launcher_services.check_internet_connection = lambda *args, **kwargs: True
+    from wisc.services import banners
+    banners.get_local_banner_for_target = lambda target, *args: str(Path("banners") / (
+        "portal.png" if str((target or {}).get("loader", "Vanilla")).casefold() != "vanilla" else "farmhouse.png"))
+
+    async def fixture_banner(target, *args):
+        return banners.get_local_banner_for_target(target)
+
+    banners.ensure_banner_for_target = fixture_banner
     random.seed(0)
 
     def preview(page):
@@ -100,6 +120,10 @@ def serve_preview(directory: Path, port: int) -> None:
         async def ready():
             # Wait for the launcher's entrance animations before checking paint.
             await asyncio.sleep(2)
+            if route != "home":
+                from wisc.core import state
+                state.navigation_state["navigate"](route)
+                await asyncio.sleep(1)
             (directory / "ready").write_text("ready", encoding="utf-8")
         page.run_task(ready)
 
@@ -147,34 +171,7 @@ def validate_screenshot(data: bytes) -> None:
                 raise RuntimeError("The screenshot contains an unrendered launcher panel.")
 
 
-# Sidebar geometry at the preview window size: 190px sidebar, 40px title bar,
-# 16px vertical padding and 48px nav rows.
-SIDEBAR_X = 95
-SIDEBAR_ROWS = {
-    "home": 209, "library": 257, "mods": 305, "skins": 353,
-    "settings": 547, "accounts": 595,
-}
-
-
-def press_shortcut(devtools: "DevTools", label: str) -> None:
-    """Click the sidebar item for the given tab in the preview."""
-    y = SIDEBAR_ROWS.get(label.lower())
-    if y is None:
-        raise RuntimeError(f"Unknown sidebar item: {label}")
-    devtools.call("Input.dispatchMouseEvent", {
-        "type": "mouseMoved", "x": SIDEBAR_X, "y": y,
-        "buttons": 0, "pointerType": "mouse",
-    })
-    for event_type, buttons in (("mousePressed", 1), ("mouseReleased", 0)):
-        devtools.call("Input.dispatchMouseEvent", {
-            "type": event_type,
-            "x": SIDEBAR_X, "y": y,
-            "button": "left", "buttons": buttons, "clickCount": 1,
-            "pointerType": "mouse",
-        })
-
-
-def capture(output: Path, browser: Path, tab: str = "home") -> None:
+def capture(output: Path, browser: Path, *, route: str = "home") -> None:
     from websockets.sync.client import connect
     temporary_root = (PROJECT_ROOT / "temp").resolve()
     if not temporary_root.is_relative_to(PROJECT_ROOT):
@@ -194,6 +191,7 @@ def capture(output: Path, browser: Path, tab: str = "home") -> None:
             server = subprocess.Popen([
                 sys.executable, str(Path(__file__).resolve()), "--serve", str(directory),
                 "--port", str(port),
+                "--route", route,
             ], stdout=log, stderr=log, **process_options)
             try:
                 deadline = time.monotonic() + 75
@@ -234,66 +232,47 @@ def capture(output: Path, browser: Path, tab: str = "home") -> None:
                         # Flutter exposes its rendered labels when semantics is enabled.
                         labels = devtools.evaluate("""(() => {
                             document.querySelector('flt-semantics-placeholder')?.click();
-                            return document.body?.innerText || '';
+                            // Flutter may merge a card's text and images into
+                            // one accessible label instead of DOM text nodes.
+                            const accessibleLabels = Array.from(
+                                document.querySelectorAll('[aria-label]'),
+                                element => element.getAttribute('aria-label')
+                            );
+                            return [document.body?.innerText || '', ...accessibleLabels].join('\\n');
                         })()""") or ""
-                        if (directory / "ready").is_file() and all(
-                            label in labels for label in ("Survival", "Fabric Adventure", "PLAY")
-                        ):
+                        expected = {
+                            "onboarding": ("WELCOME", "to Wisc.", "Continue"),
+                            "home": ("Survival", "Fabric Adventure", "PLAY"),
+                            "installations": ("Survival", "Fabric Adventure", "New Profile"),
+                            "mods": ("Mods", "Installed", "Discover"),
+                            "skins": ("Skins Disabled",),
+                            "options": ("Java", "Accounts", "Updates"),
+                            "options_updates": ("Launcher Updates", "Check for Updates"),
+                            "options_accounts": ("Manage Accounts", "Player"),
+                            "options_about": ("About", "Wisc"),
+                            "new_installation": ("New Profile", "Save Profile"),
+                            "account_login": ("Add Account", "Your next adventure", "Log In"),
+                        }[route]
+                        if (directory / "ready").is_file() and all(label in labels for label in expected):
                             break
                         if devtools.errors or time.monotonic() > deadline:
                             raise RuntimeError(f"Launcher did not render: {labels[:500]} {devtools.errors}")
                         time.sleep(0.25)
                     time.sleep(0.5)
-                    if tab != "home":
-                        press_shortcut(devtools, tab.capitalize())
-                        marker = {
-                            "library": "New Profile",
-                            "mods": "Installed",
-                            "skins": "Skins",
-                            "settings": "Launch Behavior",
-                            "accounts": "Add Account",
-                        }[tab]
-                        marker_deadline = time.monotonic() + 30
-                        while True:
-                            text = devtools.evaluate(
-                                "document.body?.innerText || ''"
-                            ) or ""
-                            if marker in text:
-                                break
-                            if time.monotonic() > marker_deadline:
-                                raise RuntimeError(
-                                    f"The {tab} tab did not render: {text[:300]}"
-                                )
-                            time.sleep(0.25)
-                        time.sleep(0.8)
-                        devtools.call("Input.dispatchMouseEvent", {
-                            "type": "mouseMoved", "x": 1040, "y": 620,
-                            "buttons": 0, "pointerType": "mouse",
-                        })
-                        time.sleep(0.4)
                     screenshot = devtools.call("Page.captureScreenshot", {
                         "format": "png", "captureBeyondViewport": False,
                     })
                     if devtools.errors:
                         raise RuntimeError(f"Browser rendering errors: {devtools.errors}")
                     data = base64.b64decode(screenshot["data"])
-                    # Flutter can report its semantics labels before the first
-                    # frame is painted, so keep retrying until pixels settle.
-                    paint_deadline = time.monotonic() + 60
-                    while True:
-                        try:
-                            validate_screenshot(data)
-                            break
-                        except RuntimeError:
-                            if time.monotonic() > paint_deadline:
-                                raise
-                            time.sleep(0.5)
-                            screenshot = devtools.call("Page.captureScreenshot", {
-                                "format": "png", "captureBeyondViewport": False,
-                            })
-                            if devtools.errors:
-                                raise RuntimeError(f"Browser rendering errors: {devtools.errors}")
-                            data = base64.b64decode(screenshot["data"])
+                    if route == "home":
+                        validate_screenshot(data)
+                    else:
+                        from PIL import Image, ImageStat
+                        with Image.open(io.BytesIO(data)) as picture:
+                            deviation = ImageStat.Stat(picture.crop((20, 80, WIDTH - 20, HEIGHT - 20)).convert("RGB")).stddev
+                            if picture.size != (WIDTH, HEIGHT) or max(deviation) < 12:
+                                raise RuntimeError("The requested launcher page did not render.")
                     output.parent.mkdir(parents=True, exist_ok=True)
                     output.write_bytes(data)
                     devtools.call("Browser.close")
@@ -317,18 +296,23 @@ def capture(output: Path, browser: Path, tab: str = "home") -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "dist/gr8-launcher-home.png")
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "dist/wisc-home.png")
     parser.add_argument("--browser", help="Edge or Chrome executable (auto-detected by default)")
-    parser.add_argument("--tab", choices=["home", "library", "mods", "skins", "settings", "accounts"],
-                        default="home", help="Launcher tab to capture (default: home)")
     parser.add_argument("--checksum-file", type=Path, help="Add the PNG to an existing SHA256SUMS.txt")
     parser.add_argument("--serve", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--route", default="home", choices=("home", "onboarding", "installations", "mods", "skins", "options",
+                        "options_updates", "options_accounts", "options_about", "new_installation", "account_login"),
+                        help="Launcher page to capture using isolated sample data")
+    parser.add_argument("--width", type=int, default=1100)
+    parser.add_argument("--height", type=int, default=650)
     args = parser.parse_args()
+    global WIDTH, HEIGHT
+    WIDTH, HEIGHT = args.width, args.height
     if args.serve:
-        serve_preview(args.serve.resolve(), args.port)
+        serve_preview(args.serve.resolve(), args.port, args.route)
         return
-    capture(args.output.resolve(), find_browser(args.browser), args.tab)
+    capture(args.output.resolve(), find_browser(args.browser), route=args.route)
     if args.checksum_file:
         lines = args.checksum_file.read_text(encoding="utf-8").splitlines()
         lines = [line for line in lines if line.split("  ", 1)[-1] != args.output.name]

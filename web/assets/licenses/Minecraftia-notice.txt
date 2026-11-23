@@ -1,0 +1,8 @@
+Minecraftia Regular
+Author: Andrew Tyler
+Author website: https://www.andrewtyler.net/
+Source: https://www.dafont.com/minecraftia.font
+
+Embedded font license notice: Creative Commons Attribution Share Alike
+The original font and its bundled readme are retained without modification.
+The launcher GPL license does not replace third-party font terms.

@@ -24,7 +24,7 @@ def build_updater(output: Path | None = None) -> Path:
     subprocess.run([
         str(compiler), "/nologo", "/target:winexe", "/platform:x64", "/optimize+",
         "/warnaserror+", f"/out:{output}",
-        f"/win32icon:{ROOT / '.assets' / 'icons' / 'gr8_icon.ico'}",
+        f"/win32icon:{ROOT / '.assets' / 'icons' / 'wisc.ico'}",
         f"/win32manifest:{ROOT / 'tools' / 'updater' / 'app.manifest'}",
         "/reference:System.dll", "/reference:System.Core.dll", "/reference:System.Drawing.dll",
         "/reference:System.Windows.Forms.dll", "/reference:System.Web.Extensions.dll",

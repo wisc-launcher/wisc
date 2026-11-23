@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_NAME = "Gr8Launcher"
+APP_NAME = "Wisc"
 VERSION_PATTERN = re.compile(
     r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -78,8 +78,8 @@ def build(version: str, compiler: Path | None) -> list[Path]:
     updater = build_updater()
 
     assets = PROJECT_ROOT / ".assets"
-    bridge = PROJECT_ROOT / "tools" / "gr8-skin-bridge" / "gr8-skin-bridge.jar"
-    for required in (assets / "icons" / "gr8_icon.ico", bridge):
+    bridge = PROJECT_ROOT / "tools" / "wisc-skin-bridge" / "wisc-skin-bridge.jar"
+    for required in (assets / "icons" / "wisc.ico", bridge):
         if not required.is_file():
             raise RuntimeError(f"Required release asset is missing: {required}")
 
@@ -95,14 +95,14 @@ def build(version: str, compiler: Path | None) -> list[Path]:
     command = [
         sys.executable, "-m", "flet.cli", "pack", str(PROJECT_ROOT / "main.py"),
         "--yes", "--onedir", "--name", APP_NAME,
-        "--icon", str(assets / "icons" / "gr8_icon.ico"),
-        "--product-name", "Gr8 Launcher",
+        "--icon", str(assets / "icons" / "wisc.ico"),
+        "--product-name", "Wisc",
         "--file-description", "Minecraft Java Edition launcher",
         "--product-version", version,
         "--file-version", f"{numeric_version}.0",
-        "--company-name", "Gr8 Projects",
+        "--company-name", "Wisc",
         "--add-data", f"{assets}{os.pathsep}.assets",
-        "--add-data", f"{bridge}{os.pathsep}tools/gr8-skin-bridge",
+        "--add-data", f"{bridge}{os.pathsep}tools/wisc-skin-bridge",
         "--", "--clean",
         "--paths", str(PROJECT_ROOT),
         "--collect-submodules", "minecraft_launcher_lib",
@@ -121,7 +121,7 @@ def build(version: str, compiler: Path | None) -> list[Path]:
     # Import the UI-independent inventory writer from the project source.
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
-    from launcher_updates import generate_manifest
+    from wisc.services.updates import generate_manifest
     generate_manifest(app_dir, version)
 
     archive_name = f"{APP_NAME}-{version}-windows-x64"

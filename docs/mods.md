@@ -1,41 +1,31 @@
 # Mods page
 
-The Mods sidebar entry has a content selector for **Mods** and
+The Mods top tab has a content selector for **Mods** and
 [**Modpacks**](modpacks.md). Mods opens a manager for one Minecraft profile. The Library's
 Manage Mods button opens the profile from that row. The Mods profile selection is
 independent of the profile selected for Play.
 
-Preview screenshots use isolated sample data:
-[Installed](screenshots/gr8-launcher-mods-installed.png),
-[Browse](screenshots/gr8-launcher-mods-browse.png),
-[Profile selector](screenshots/gr8-launcher-mods-selector.png),
-[Mod details](screenshots/gr8-launcher-mods-details.png),
-[Versions](screenshots/gr8-launcher-mods-versions.png), and
-[Unavailable profile](screenshots/gr8-launcher-mods-unavailable.png).
-The [Undo notification](screenshots/gr8-launcher-mods-undo.png) restores a removed mod.
-Details previews also include the [larger window](screenshots/gr8-launcher-mods-details-large.png)
-and [formatted content](screenshots/gr8-launcher-mods-details-content.png).
-
 ## Layout
 
-The custom title bar and left navigation stay visible. The content has 20 px left
-and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
+The custom title bar and top navigation stay visible. The content has the classic
+28 px horizontal and 20 px top padding and fills the remaining window at
+1100 × 650 or larger.
 
-1. **Header:** “Mods” in 32 px Pixelify Sans, with a compact frosted profile
+1. **Header:** “Mods” in the classic 24 px system-font heading, with a compact rounded profile
    selector on the right. It shows the profile artwork/name and Minecraft version
    with its loader; build details stay in the selection page.
 2. **Profile selection:** the header selector opens a separate Library-style
    page using the shared profile rows, badges, build details, and scrollable
-   `ProfileList`. Select chooses the Mods target; Selected and a gold outline
+   `ProfileList`. Select chooses the Mods target; Selected and a theme-colored outline
    mark the current one.
-   The compact chevron/Back control matches Add Account and keeps the current
+   The compact arrow/Back control matches Options and keeps the current
    profile, query, filters, and scroll position.
 3. **Content:** the header's acrylic selector switches between Mods and Modpacks.
    Pack browsing works without choosing a profile; installing a pack creates its
    own instance with pinned Minecraft and loader versions.
    **Tabs:** Discover and Installed with its mod count. Discover shows a quiet
    attribution label for the selected provider, Modrinth or CurseForge.
-4. **Toolbar:** the shared `SimpleInput` at its normal intrinsic height, with no
+4. **Toolbar:** the shared `SimpleInput` search field at its standard 48 px height, with no
    Mods-specific height or padding overrides, 5 px corners, and a mode-specific
    search hint; All/Enabled/Disabled, Add JARs, and Refresh for
    Installed, or source and sort selectors for Discover, initially Modrinth and
@@ -52,8 +42,8 @@ and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
    dependencies. The page shows a compatible
    result count in Discover or enabled/disabled counts in Installed. The header
    provides the profile's version/loader context.
-6. **Scrollable rows:** the existing `ProfileList` and frosted 5 px profile surface
-   with 48 px artwork, 16 px horizontal padding, and muted supporting text.
+6. **Scrollable rows:** the existing list controls and matte 12 px profile surface
+   with 48 px artwork, 16 px horizontal padding, system-font titles, and muted supporting text.
    Installed rows show name, description when available, version, size,
    enable switch, and removal. The filename remains available in details and search.
    Clicking the artwork/title area
@@ -85,7 +75,7 @@ and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
   key. The native credential vault stores it separately from account sessions;
   if that vault is unavailable, the key lasts only for this launcher session.
   It is never written to profile/settings files. Deployments can supply
-  `GR8_CURSEFORGE_API_KEY` instead. API keys are sent only to the CurseForge API,
+  `WISC_CURSEFORGE_API_KEY` instead. API keys are sent only to the CurseForge API,
   with API redirects disabled. The launcher does not use Prism's bundled key.
 - CurseForge files without an API download URL require a manual download, as
   in Prism. The review links to each exact official file and asks for the
@@ -95,7 +85,7 @@ and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
   place. Wrong or changed files fail verification. Additional required files
   discovered during planning must also be selected. Restricted CDN URLs are
   never synthesized or bypassed.
-- `SimpleInput` and `SimpleButton` live in `ui_controls.py` and are imported by
+- `SimpleInput` and `SimpleButton` live in `wisc/ui/controls.py` and are imported by
   the launcher and Mods. Selectors and buttons, profile surfaces, list controls,
   brief `StaggeredReveal` transitions, dialog host, and toast host are reused.
   Normal searching retains matching row objects. Back from a mod page restores
@@ -103,9 +93,9 @@ and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
   Disk scans and searches run during the entrance animation; their row updates
   wait for it to finish. Installed/Discover transitions animate a stable list
   body so filtering or refreshed metadata cannot reset the fade. The Mods page
-  stays mounted across sidebar navigation. Only visible rows and a small scroll
+  stays mounted across tab navigation. Only visible rows and a small scroll
   buffer are constructed, with spacers preserving the full scrollbar range.
-  Returning from a sidebar tab recreates the scroll viewport while retaining
+  Returning from a top tab recreates the scroll viewport while retaining
   the row cache and saved position. Events from an old viewport are ignored;
   background identity changes wait until the entrance has finished.
   Row changes are sent together with page feedback.
@@ -178,7 +168,7 @@ and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
   description fills the available width beside the 236 px metadata panel, with
   a consistent 24 px gap as the window resizes. Metadata and external links share
   a compact frosted panel; both the description and panel scroll independently.
-- `mod_markdown.py` converts embedded HTML to native Markdown before rendering.
+- `wisc/mods/markdown.py` converts embedded HTML to native Markdown before rendering.
   It preserves links, images, nested lists, tables, warnings, FAQ contents, and
   code examples. HTML presentation attributes are omitted; embedded media is
   offered as a link. Existing Markdown stays intact, including fenced/indented
@@ -190,7 +180,7 @@ and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
   The release dropdown is the only release filter: Stable by default, All releases,
   Beta, or Alpha. Changing it resets version pagination and keeps the selected
   option across navigation. Shared selectors have a dark background and 5 px
-  corners by default, including the Versions filter and Settings selectors.
+  corners by default, including the Versions filter and Options selectors.
 - Selecting another installed provider version shows the exact replacement and
   required dependencies before confirmation. A successful replacement retains the
   previous JAR in launcher trash and preserves the mod's enabled state. A failed
@@ -233,7 +223,7 @@ and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
   changes an installed file.
   Mod details also expose an Update action when their
   loaded version history contains a newer matching version.
-- Update checks are saved in the instance's `gr8launcher/mod-updates.json`, including
+- Update checks are saved in the instance's `wisc/mod-updates.json`, including
   checks that found no updates. Navigation and launcher restarts restore the
   matching result without another online check, and the last checked release
   filter is restored when reopening an instance. Saved results are scoped to
@@ -326,20 +316,20 @@ and 24 px right padding and fills the remaining window at 1100 × 650 or larger.
   Disabled suffixes are recognized regardless of capitalization. Minecraft
   applies these changes on its next launch.
 - Remove requires confirmation and moves the JAR to the selected game folder's
-  `gr8launcher/mod-trash/<token>/`. Each removal notification's Undo action
+  `wisc/mod-trash/<token>/`. Each removal notification's Undo action
   restores that exact JAR, including its enabled state, even if the selected
   profile changes to Vanilla or a global profile. The original instance folder
   must still exist. Dismissed/expired removals remain in trash for manual recovery.
   Existing files are never replaced by Undo, and actions still respect the
   running-game lock.
-- The managed-mod index lives in `gr8launcher/mods.json` alongside the selected
+- The managed-mod index lives in `wisc/mods.json` alongside the selected
   game folder. Downloads, imports, toggles, and removals are blocked while
   Minecraft is starting or running. Vanilla and missing-instance profiles show
   instructions for selecting or creating a usable modded profile.
 - JARs copied directly into the instance's mods folder appear on refresh. Local
   metadata remains available offline. Background checksum lookups identify
   provider-hosted files, including renamed JARs, and store a bounded optional
-  `gr8launcher/mod-identities.json` cache. Cached identities survive restart and
+  `wisc/mod-identities.json` cache. Cached identities survive restart and
   are reused only when the actual checksum matches; replacing a JAR externally
   invalidates its former identity. A corrupt identity cache does not block local
   file actions. Unknown files retain their local metadata, enable/disable, and

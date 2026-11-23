@@ -2,7 +2,23 @@
 
 ## Project Structure & Module Organization
 
-`main.py` runs the Python/Flet UI. `launcher.py` and `launcher_services.py` handle Minecraft installation and launch; `storage.py` and `credential_store.py` manage persistence. UI components live in `ui_*.py`. Bundled artwork/fonts live in `.assets/`, tests/scratch work in `temp/`, build utilities and the Java skin bridge in `tools/`, installer configuration in `packaging/`, and documentation in `docs/`.
+`main.py` is the launch entry point; `wisc/app.py` owns Flet page orchestration. Application modules live in four packages:
+
+| Folder | Start here for |
+| --- | --- |
+| `wisc/ui/` | Pages, controls, dialogs, profiles, themes, motion, progress, and notifications |
+| `wisc/services/` | Minecraft launch/install, instance discovery, profile creation, authentication, skins, artwork, Discord, and updates |
+| `wisc/mods/` | Mod providers, compatibility, downloads, metadata, and modpacks |
+| `wisc/core/` | Shared state, settings/profiles, native credentials, palette definitions, and resource paths |
+
+Bundled artwork/fonts live in `.assets/`, local tests/scratch work in ignored `temp/`, build/release utilities and the Java skin bridge in `tools/`, installer configuration in `packaging/`, documentation in `docs/`, and the website in `web/` with deployment API functions in `api/`.
+
+## Agent Navigation
+
+- Use [docs/architecture.md](docs/architecture.md) for the module map and resource/entry-point rules. Search the relevant package first, for example `rg -n 'ProfileList' wisc/ui` or `rg --files wisc tools`.
+- Avoid whole-workspace scans of generated files or local tests unless the task needs them. Old source copies belong outside the repository; do not recreate `REF/` or `new_ui/` backups.
+- Use absolute `wisc.*` imports. Keep package `__init__.py` files lightweight and avoid compatibility copies at the repository root.
+- Put new scratch output in `temp/<task>/` and remove it when finished. Retain useful local regression tests; release tools must run without `temp/`.
 
 ## Build, Test, and Development Commands
 
@@ -16,14 +32,21 @@ Run from the repository root in a virtual environment. Source supports Python 3.
 
 ## Launcher Design Language
 
-Follow `design_theme.txt` and existing components:
+Follow `design_theme.txt` and the restored classic components:
 
-- **Palette:** navy `#182842`, warm gold/beige `#f5de9a`, subtle ambient glow `#454641`; transparent/acrylic or `ft.Colors.BLACK_26` surfaces.
-- **Typography/assets:** use `ps` (Pixelify Sans) for primary UI, system fonts for dense details. Reuse Minecraft artwork/icons and retain font licenses.
-- **Shape:** prefer sharp edges or 5px rounded rectangles. Match existing frosted profile, dialog, and toast surfaces; keep borders and hover fills rare while preserving selection/focus feedback.
-- **Dropdowns:** use the shared `AcrylicSelector`. Closed fields have a `ft.Colors.BLACK_26` background, 5px corners, 48px height, and a gold label/chevron. Keep popup menus acrylic and anchored to the field width, with no added hover fill or default outline. Use one control for each filter.
-- **Layout:** retain left navigation, the custom title bar, banner/skin preview, and compact profile rows. Check 1100x650 and larger windows; keep content scrollable and window controls usable.
-- **Motion/feedback:** reuse `StaggeredReveal`, `ProfileDialogHost`, `ProfileList`, and `ToastHost`. Keep transitions brief (180-320ms) and interruptible. Restore state after navigation/canceled drags; use concise labels and meaningful loading/error feedback.
+- **Palette:** selectable Minecraft themes in `wisc/core/themes.py`, defaulting to Earth 2, supply action, selection, and focus accents. Chrome and page elements use the fixed dark translucent palette in `wisc/ui/glass.py`, including retained features through `wisc.ui.theme.apply_legacy_theme`.
+- **Typography/assets:** use the supplied Wisc logo and bundled Pixelify Sans for branding and pixel text. Keep existing Minecraft artwork and all bundled font licenses, including the legacy notices in `.assets/font/`. Use system fonts for dense details.
+- **Shape:** preserve rounded library cards, compact profile rows, and options cards. Page cards and shared surfaces use frosted glass with rounded corners and no resting outlines; the fixed title bar spans the full width. Keep selection and focus feedback visible, and keep Home's launch panel transparent.
+- **Dropdowns:** use `AcrylicSelector`, or the `LegacySelector` adapter for classic forms. Menus stay anchored to the field width, with 48px closed fields, 5px corners, light labels and chevrons, and theme accents for selected items. Use one control per filter.
+- **Layout:** retain the original top navigation, custom window controls, Home launch panel, and library shelf. Keep selected version artwork across every page and do not restore a separate Home banner. Keep Mods & Modpacks and Options > Updates accessible. Check 1100x650 and larger windows; keep content scrollable and window controls usable.
+- **Motion/feedback:** keep the classic tab transitions and reuse `StaggeredReveal`, `ProfileDialogHost`, `ProfileList`, `ProgressHost`, and `ToastHost` for retained features. Keep transitions interruptible, restore state after navigation/canceled drags, and provide concise loading/error feedback.
+
+## Reuse Existing Components
+
+- Before adding a component, helper, or workflow anywhere in the repository, check the relevant package for an existing implementation and reuse or extend it.
+- Build new UI features by composing the existing page layouts, controls, surfaces, selectors, dialogs, progress, and notifications. Use the Mods area as the reference for discovery lists, toolbars, rows, and installation flows.
+- Use `card_surface` and `ModList` for discovery rows, keeping the Mods area's 8px row gaps, padding, typography, and stable row keys. Do not rebuild equivalent rows or dropdowns separately for each content type.
+- Keep shared behavior and styling in shared helpers. Add a new implementation only when existing components cannot support the feature, and preserve the established design and lifecycle patterns.
 
 ## Coding Style & Naming Conventions
 
@@ -59,4 +82,4 @@ Use focused, descriptive subjects like `Add remote tag validation`. PRs should e
 
 ## Security & Configuration Tips
 
-Runtime data lives in Minecraft's `gr8launcher/`. Preserve native credential storage/redaction. Exclude tokens, personal game data, and generated `build/`/`dist/` artifacts.
+Runtime data lives in Minecraft's `wisc/`; migrate existing `gr8launcher/` folders through `wisc.core.paths.launcher_data_dir`, preserving files and rebasing absolute data paths. Preserve native credential storage/redaction and legacy credential aliases, including aliases scoped to the old accounts path. Exclude tokens, personal game data, and generated `build/`/`dist/` artifacts.

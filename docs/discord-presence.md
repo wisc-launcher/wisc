@@ -1,7 +1,7 @@
 # Discord Rich Presence
 
-Gr8 Launcher uses Discord application `1559999125200568320`. Presence is enabled
-by default and can be turned off in **Settings → General → Discord Rich Presence**.
+Wisc uses Discord application `1559999125200568320`. Presence is enabled
+by default and can be turned off in **Options > Launcher > Discord Presence**.
 The Discord desktop app must be running and allow activity sharing.
 
 Presence shows the current launcher page, installation or launch preparation,
@@ -29,14 +29,14 @@ setting also clears it immediately, without waiting for the update interval.
 
 ## Application configuration
 
-The public application ID lives in `discord_presence.py`. To test another
-application without changing the source, set `GR8_DISCORD_APPLICATION_ID` before
+The public application ID lives in `wisc/services/discord_presence.py`. To test another
+application without changing the source, set `WISC_DISCORD_APPLICATION_ID` before
 starting the launcher. No bot token, OAuth login, or client secret is required.
 The activity name comes from the application's name in the
 [Discord Developer Portal](https://discord.com/developers/applications).
 
 The large image uses the project's existing logo URL. To use an uploaded Discord
-asset instead, upload `.assets/icons/gr8_icon.png` under the application's Rich
+asset instead, upload `.assets/icons/wisc.png` under the application's Rich
 Presence assets and set `DISCORD_LOGO` to its asset key.
 
 The launcher uploads only the face thumbnail to Catbox, then Discord fetches and

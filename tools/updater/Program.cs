@@ -18,7 +18,7 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-namespace Gr8Updater
+namespace WiscUpdater
 {
     public sealed class Identity
     {
@@ -38,6 +38,7 @@ namespace Gr8Updater
         public string package { get; set; }
         public string package_hash { get; set; }
         public string staging { get; set; }
+        public string bundle_root { get; set; }
         public string state_path { get; set; }
         public Identity launcher { get; set; }
     }
@@ -77,6 +78,7 @@ namespace Gr8Updater
 
     internal static class Data
     {
+        public static readonly string[] BundleNames = { "Wisc", "Gr8Launcher" };
         static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer { MaxJsonLength = 16 * 1024 * 1024 };
         public static T Read<T>(string path)
         {
@@ -146,11 +148,22 @@ namespace Gr8Updater
         {
             return entry != null && File.Exists(path) && new FileInfo(path).Length == entry.size && Hash(path) == entry.sha256.ToLowerInvariant();
         }
+        public static string LauncherExecutable(Inventory inventory)
+        {
+            string[] names = BundleNames.Select(name => name + ".exe").Where(name => inventory.files.ContainsKey(name)).ToArray();
+            if (names.Length != 1) throw new IOException("The bundle has no unique launcher executable.");
+            return names[0];
+        }
+        public static bool ValidStaging(string appDir, string staging, string operationId)
+        {
+            return new[] { ".wisc-update-", ".gr8-update-" }.Any(prefix =>
+                Same(staging, Path.Combine(Path.GetDirectoryName(appDir), prefix + operationId)));
+        }
         public static Inventory Manifest(string root, string version)
         {
             Inventory inventory = Read<Inventory>(Relative(root, "bundle-manifest.json"));
             if (inventory == null || inventory.schema != 1 || inventory.version != version || inventory.files == null || inventory.files.Count > 30000 ||
-                !inventory.files.ContainsKey("Gr8Launcher.exe") || !inventory.files.ContainsKey("updater.exe") || !inventory.files.ContainsKey("VERSION"))
+                !inventory.files.ContainsKey("updater.exe") || !inventory.files.ContainsKey("VERSION"))
                 throw new IOException("The application bundle inventory is invalid.");
             HashSet<string> paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (KeyValuePair<string, Entry> item in inventory.files)
@@ -160,6 +173,7 @@ namespace Gr8Updater
                     item.Value.size < 0 || !Regex.IsMatch(item.Value.sha256 ?? "", "^[0-9a-fA-F]{64}$"))
                     throw new IOException("The bundle inventory has invalid file entries.");
             }
+            LauncherExecutable(inventory);
             return inventory;
         }
         public static void Verify(string root, Inventory inventory)
@@ -254,7 +268,7 @@ namespace Gr8Updater
                     string path;
                     try { path = process.MainModule.FileName; }
                     catch (Exception) { continue; }
-                    if (Data.Same(path, Path.Combine(appDir, "Gr8Launcher.exe")))
+                    if (Data.BundleNames.Any(name => Data.Same(path, Path.Combine(appDir, name + ".exe"))))
                         throw new IOException("Another copy of this launcher is running. Close it before updating.");
                 }
             }
@@ -289,14 +303,15 @@ namespace Gr8Updater
             if (Path.GetFileName(Path.GetDirectoryName(operation)) != "operations" ||
                 !Data.Within(h.state_path, Path.Combine(cache, "installations")) ||
                 Path.GetFileName(h.state_path) != "state.json" || !Data.Within(h.package, operation)) throw new IOException("Unsafe update cache paths.");
-            Data.Relative(h.app_dir, "Gr8Launcher.exe");
+            foreach (string name in Data.BundleNames) Data.Relative(h.app_dir, name + ".exe");
             if (h.mode == "portable")
             {
-                string expected = Path.Combine(Path.GetDirectoryName(h.app_dir), ".gr8-update-" + h.operation_id);
-                if (!Data.Same(h.staging, expected)) throw new IOException("Unsafe update staging directory.");
-                stageRoot = Path.Combine(h.staging, "payload", "Gr8Launcher");
+                if (!Data.ValidStaging(h.app_dir, h.staging, h.operation_id)) throw new IOException("Unsafe update staging directory.");
+                string bundleRoot = h.bundle_root ?? "Gr8Launcher";
+                if (!Data.BundleNames.Contains(bundleRoot)) throw new IOException("Invalid update bundle folder.");
+                stageRoot = Path.Combine(h.staging, "payload", bundleRoot);
                 backup = Path.Combine(h.staging, "backup");
-                Data.Relative(h.staging, "payload/Gr8Launcher/VERSION");
+                Data.Relative(h.staging, "payload/" + bundleRoot + "/VERSION");
             }
         }
         void Result(string status, string message)
@@ -319,6 +334,7 @@ namespace Gr8Updater
                     throw new IOException("Reopen the launcher normally before updating. Only setup should request administrator approval.");
             string key;
             using (SHA256 sha = SHA256.Create()) key = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(Path.GetFullPath(h.app_dir).ToLowerInvariant()))).Replace("-", "");
+            // Retain the mutex name to exclude older helpers for the same install.
             using (Mutex mutex = new Mutex(false, @"Global\Gr8LauncherUpdate-" + key))
             {
                 bool owned;
@@ -335,7 +351,7 @@ namespace Gr8Updater
                     if (Data.Hash(Path.Combine(operation, "updater.exe")) != old.files["updater.exe"].sha256.ToLowerInvariant())
                         throw new IOException("The staged updater does not match this installation.");
                     Process original = Processes.Find(h.launcher);
-                    if (original == null || !Data.Same(original.MainModule.FileName, Path.Combine(h.app_dir, "Gr8Launcher.exe")))
+                    if (original == null || !Data.Same(original.MainModule.FileName, Data.Relative(h.app_dir, Data.LauncherExecutable(old))))
                         throw new IOException("The original launcher process is invalid.");
                     List<Identity> originals;
                     // The launcher spawns this helper; exclude its entire subtree from shutdown waits.
@@ -388,6 +404,8 @@ namespace Gr8Updater
         void Prepare(Inventory old)
         {
             Inventory next = Data.Manifest(stageRoot, h.new_version);
+            if (Data.LauncherExecutable(next) != Path.GetFileName(stageRoot) + ".exe")
+                throw new IOException("The bundle folder does not match its launcher executable.");
             Data.Verify(stageRoot, next);
             HashSet<string> actual = new HashSet<string>(Directory.GetFiles(stageRoot, "*", SearchOption.AllDirectories).Select(p => p.Substring(stageRoot.Length + 1).Replace('\\', '/')), StringComparer.OrdinalIgnoreCase);
             if (!actual.SetEquals(next.files.Keys.Concat(new[] { "bundle-manifest.json" }))) throw new IOException("The staged payload contains unlisted files.");
@@ -397,7 +415,7 @@ namespace Gr8Updater
             HashSet<string> names = new HashSet<string>(old.files.Keys, StringComparer.OrdinalIgnoreCase);
             names.UnionWith(next.files.Keys);
             if (names.Count != old.files.Keys.Union(next.files.Keys).Count()) throw new IOException("The update changes file name casing ambiguously.");
-            foreach (string path in names.OrderBy(p => p == "Gr8Launcher.exe" ? 1 : 0).ThenBy(p => p, StringComparer.Ordinal))
+            foreach (string path in names.OrderBy(p => Data.BundleNames.Any(name => p == name + ".exe") ? 1 : 0).ThenBy(p => p, StringComparer.Ordinal))
             {
                 Entry before, after;
                 old.files.TryGetValue(path, out before);
@@ -453,7 +471,7 @@ namespace Gr8Updater
             Launch(true);
             AwaitStartup();
             SaveJournal("succeeded");
-            Result("succeeded", "Gr8 Launcher was updated to v" + h.new_version + ".");
+            Result("succeeded", "Wisc was updated to v" + h.new_version + ".");
             Cleanup();
             report("Update complete", "Your launcher is ready.", 1);
         }
@@ -494,18 +512,27 @@ namespace Gr8Updater
             Data.Verify(h.app_dir, Data.Manifest(h.app_dir, h.new_version));
             Launch(true);
             AwaitStartup();
-            Result("succeeded", "Gr8 Launcher was updated to v" + h.new_version + ".");
+            Result("succeeded", "Wisc was updated to v" + h.new_version + ".");
             report("Update complete", "Your launcher is ready.", 1);
         }
         void Launch(bool update)
         {
-            ProcessStartInfo info = new ProcessStartInfo(Data.Relative(h.app_dir, "Gr8Launcher.exe")) { WorkingDirectory = h.app_dir, UseShellExecute = false };
-            info.EnvironmentVariables.Remove("GR8_UPDATE_HANDOFF");
-            info.EnvironmentVariables.Remove("GR8_UPDATE_NONCE");
+            string version = File.ReadAllText(Data.Relative(h.app_dir, "VERSION")).Trim().TrimStart('\uFEFF');
+            string executable = Data.LauncherExecutable(Data.Manifest(h.app_dir, version));
+            ProcessStartInfo info = new ProcessStartInfo(Data.Relative(h.app_dir, executable)) { WorkingDirectory = h.app_dir, UseShellExecute = false };
+            foreach (string prefix in new[] { "WISC", "GR8" })
+            {
+                info.EnvironmentVariables.Remove(prefix + "_UPDATE_HANDOFF");
+                info.EnvironmentVariables.Remove(prefix + "_UPDATE_NONCE");
+            }
             if (update)
             {
-                info.EnvironmentVariables["GR8_UPDATE_HANDOFF"] = handoffPath;
-                info.EnvironmentVariables["GR8_UPDATE_NONCE"] = h.nonce;
+                // Old executables acknowledge the legacy variables during recovery.
+                foreach (string prefix in new[] { "WISC", "GR8" })
+                {
+                    info.EnvironmentVariables[prefix + "_UPDATE_HANDOFF"] = handoffPath;
+                    info.EnvironmentVariables[prefix + "_UPDATE_NONCE"] = h.nonce;
+                }
             }
             launched = Process.Start(info);
             launchedTree = Processes.Tree(launched);
@@ -604,7 +631,7 @@ namespace Gr8Updater
         {
             try
             {
-                if (!Data.Same(h.staging, Path.Combine(Path.GetDirectoryName(h.app_dir), ".gr8-update-" + h.operation_id))) return;
+                if (!Data.ValidStaging(h.app_dir, h.staging, h.operation_id)) return;
                 // Validate all generated paths before a recursive cleanup; never follow reparse points.
                 foreach (string path in Directory.EnumerateFileSystemEntries(h.staging, "*", SearchOption.AllDirectories))
                     Data.Relative(h.staging, path.Substring(h.staging.Length + 1).Replace('\\', '/'));
@@ -632,13 +659,20 @@ namespace Gr8Updater
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = navy;
-            Text = "Gr8 Launcher Update";
+            Text = "Wisc Update";
             DoubleBuffered = true;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch (Exception) { }
             string font = Path.Combine(Application.StartupPath, "PixelifySans.ttf");
             if (File.Exists(font)) fonts.AddFontFile(font);
             Font primary = fonts.Families.Length > 0 ? new Font(fonts.Families[0], 13) : new Font("Segoe UI", 12);
-            Label brand = new Label { Text = "GR8 LAUNCHER", ForeColor = gold, BackColor = Color.Transparent, Font = primary, Location = new Point(24, 18), AutoSize = true };
+            string mark = Path.Combine(Application.StartupPath, "wisc_mark.png");
+            if (File.Exists(mark))
+            {
+                PictureBox logo = new PictureBox { Image = Image.FromFile(mark), SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.Transparent, Location = new Point(24, 18), Size = new Size(31, 22) };
+                logo.MouseDown += Drag;
+                Controls.Add(logo);
+            }
+            Label brand = new Label { Text = "Wisc", ForeColor = gold, BackColor = Color.Transparent, Font = primary, Location = new Point(File.Exists(mark) ? 65 : 24, 18), AutoSize = true };
             brand.MouseDown += Drag;
             Controls.Add(brand);
             close = new Button { Text = "×", ForeColor = gold, BackColor = navy, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 16), Location = new Point(506, 6), Size = new Size(36, 32), Enabled = false, TabStop = false };
@@ -770,7 +804,7 @@ namespace Gr8Updater
                         Engine engine = null;
                         try
                         {
-                            if (args.Length != 2 || (args[0] != "--apply" && args[0] != "--recover")) throw new IOException("Start the updater from Gr8 Launcher or use its recovery shortcut.");
+                            if (args.Length != 2 || (args[0] != "--apply" && args[0] != "--recover")) throw new IOException("Start the updater from Wisc or use its recovery shortcut.");
                             engine = new Engine(args[1], window.Report);
                             engine.Run(args[0] == "--recover");
                             window.Complete(true, "", "");

@@ -1,0 +1,144 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "website": {
+      "root": "web",
+      "buildCommand": "npm run build",
+      "outputDirectory": "dist",
+      "functions": {
+        "api/release.mjs": {
+          "maxDuration": 15
+        }
+      },
+      "routes": [
+        {
+          "src": "^/.*$",
+          "headers": {
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+            "X-Frame-Options": "DENY",
+            "Permissions-Policy": "camera=(), microphone=(), geolocation=()"
+          },
+          "continue": true
+        },
+        {
+          "src": "^/(?:home|index)(?:\\.html)?/?$",
+          "headers": {
+            "Location": "/"
+          },
+          "status": 308
+        },
+        {
+          "src": "^/skins(?:\\.html)?/?$",
+          "headers": {
+            "Location": "/cosmetics"
+          },
+          "status": 308
+        },
+        {
+          "src": "^/support(?:\\.html)?/?$",
+          "headers": {
+            "Location": "/help"
+          },
+          "status": 308
+        },
+        {
+          "src": "^/cubeon-bench(?:/.*)?$",
+          "headers": {
+            "Location": "/benchmarks"
+          },
+          "status": 308
+        },
+        {
+          "src": "^/(about|benchmarks|cookies|cosmetics|docs|doctor|download|files|getting-started|help|licenses|minecraft-launcher|modpacks|mods|multiplayer|privacy|refunds|terms|troubleshooting|403|404|429|500|502|503)\\.html/?$",
+          "headers": {
+            "Location": "/$1"
+          },
+          "status": 308
+        },
+        {
+          "src": "^/(about|benchmarks|cookies|cosmetics|docs|doctor|download|files|getting-started|help|licenses|minecraft-launcher|modpacks|mods|multiplayer|privacy|refunds|terms|troubleshooting|403|404|429|500|502|503)/$",
+          "headers": {
+            "Location": "/$1"
+          },
+          "status": 308
+        },
+        {
+          "src": "^/$",
+          "dest": "/index.html"
+        },
+        {
+          "src": "^/(about|benchmarks|cookies|cosmetics|docs|doctor|download|files|getting-started|help|licenses|minecraft-launcher|modpacks|mods|multiplayer|privacy|refunds|terms|troubleshooting)$",
+          "dest": "/$1.html"
+        },
+        {
+          "src": "^/403$",
+          "dest": "/403.html",
+          "status": 403,
+          "headers": {
+            "X-Robots-Tag": "noindex"
+          }
+        },
+        {
+          "src": "^/404$",
+          "dest": "/404.html",
+          "status": 404,
+          "headers": {
+            "X-Robots-Tag": "noindex"
+          }
+        },
+        {
+          "src": "^/429$",
+          "dest": "/429.html",
+          "status": 429,
+          "headers": {
+            "X-Robots-Tag": "noindex"
+          }
+        },
+        {
+          "src": "^/500$",
+          "dest": "/500.html",
+          "status": 500,
+          "headers": {
+            "X-Robots-Tag": "noindex"
+          }
+        },
+        {
+          "src": "^/502$",
+          "dest": "/502.html",
+          "status": 502,
+          "headers": {
+            "X-Robots-Tag": "noindex"
+          }
+        },
+        {
+          "src": "^/503$",
+          "dest": "/503.html",
+          "status": 503,
+          "headers": {
+            "X-Robots-Tag": "noindex"
+          }
+        },
+        {
+          "handle": "filesystem"
+        },
+        {
+          "src": "^/.*$",
+          "dest": "/404.html",
+          "status": 404,
+          "headers": {
+            "X-Robots-Tag": "noindex"
+          }
+        }
+      ]
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "website"
+      }
+    }
+  ]
+}

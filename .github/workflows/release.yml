@@ -70,7 +70,7 @@ jobs:
         shell: pwsh
         run: |
           $installerPath = Join-Path $env:RUNNER_TEMP "innosetup-6.7.4.exe"
-          $compilerDirectory = Join-Path $env:RUNNER_TEMP "gr8-inno-setup"
+          $compilerDirectory = Join-Path $env:RUNNER_TEMP "wisc-inno-setup"
           Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe" -OutFile $installerPath
           $expectedHash = "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c"
           if ((Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash -ne $expectedHash) {
@@ -94,7 +94,7 @@ jobs:
         run: python tools/build_windows.py --version "$env:BUILD_VERSION"
 
       - name: Capture launcher screenshot
-        run: python tools/capture_screenshot.py --output dist/gr8-launcher-home.png
+        run: python tools/capture_screenshot.py --output dist/wisc-home.png
 
       - name: Upload build downloads
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -104,7 +104,7 @@ jobs:
             dist/*.zip
             dist/*-setup.exe
             dist/SHA256SUMS.txt
-            dist/gr8-launcher-home.png
+            dist/wisc-home.png
             dist/release-notes.md
             dist/release-notes.json
           if-no-files-found: error
@@ -199,7 +199,7 @@ jobs:
             fi
             gh release edit "$RELEASE_TAG" "${update_options[@]}"
           else
-            options=( --target "$RELEASE_SHA" --generate-notes --title "Gr8 Launcher ${RELEASE_TAG#v}" )
+            options=( --target "$RELEASE_SHA" --generate-notes --title "Wisc ${RELEASE_TAG#v}" )
             if [[ -n "$EXISTING_TAG_SHA" ]]; then
               options+=( --verify-tag )
             fi

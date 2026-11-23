@@ -2,8 +2,13 @@
 
 Open **Mods → Content type → Modpacks** to browse complete packs or import a
 downloaded archive. The content selector uses the same acrylic field as the
-provider and sort controls. The sidebar, title bar, and shared progress bar stay
+provider and sort controls. The classic top navigation, title bar, and shared progress bar stay
 available.
+
+Pack browsing, installed instances, details, versions, and install reviews use
+the same classic card surfaces, system-font text, and rounded actions as Mods
+and Profiles. Queries, provider selections, and scroll positions survive tab
+navigation.
 
 ## Discover and details
 
@@ -65,7 +70,7 @@ any missing Minecraft and exact loader files.
 
 ## Pack versions and customization
 
-The instance's `gr8launcher/modpack.json` records its source, pack version, game
+The instance's `wisc/modpack.json` records its source, pack version, game
 and loader pins, and owned files with SHA-512 checksums. The original manifest is
 saved alongside it. Known CurseForge mod identities are also available to the
 existing Mods manager.

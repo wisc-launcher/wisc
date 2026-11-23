@@ -1,0 +1,20 @@
+# Deploy the website, its Node build tools, and root API functions.
+REF/
+gr8launcher/
+.assets/
+.github/
+.agents/
+.venv*/
+venv/
+temp/
+tests/
+__pycache__/
+build/
+dist/
+docs/
+packaging/
+*.py
+requirements*.txt
+tools/gr8-skin-bridge/
+tools/updater/
+*.log

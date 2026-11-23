@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "wisc-performance",
+  "version": "1.0.0",
+  "name": "Wisc 1K FPS",
+  "description": "Applies the Wisc 1K FPS preset before Minecraft reads options.txt.",
+  "authors": ["Wisc"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "preLaunch": ["com.gr8.performance.Gr8PerformanceMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.14.0",
+    "minecraft": "*"
+  }
+}

@@ -1,0 +1,7 @@
+# Static-host aliases; equivalent redirects are configured in vercel.json.
+/home / 301
+/index.html / 301
+/skins /cosmetics 301
+/support /help 301
+/cubeon-bench /benchmarks 301
+/cubeon-bench/ /benchmarks 301
