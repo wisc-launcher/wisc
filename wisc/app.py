@@ -291,6 +291,7 @@ def main(page: ft.Page):
         if (
             settings.get("performance_mode")
             and not settings.get("recommended_mods_prompted")
+            and not settings.get("performance_mods_enabled")
             and str(target.get("loader") or "").casefold() in {"fabric", "quilt"}
         ):
             accepted = await ask_recommended_performance_mods()
