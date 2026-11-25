@@ -53,6 +53,7 @@ from wisc.ui import theme as theme
 from wisc.ui.components import (
     ElidedLabel,
     GlassButton,
+    enable_smooth_scroll,
     GlassLineEdit,
     GlassPanel,
     LauncherComboBox,
@@ -282,6 +283,7 @@ def _make_scroll_area() -> tuple[QScrollArea, QVBoxLayout]:
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
     scroll.viewport().setAutoFillBackground(False)
+    enable_smooth_scroll(scroll)
 
     body = QWidget()
     body.setObjectName("optionsContent")

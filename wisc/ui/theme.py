@@ -238,8 +238,8 @@ def stylesheet(colors: dict[str, str]) -> str:
         QPushButton#launch:disabled, QPushButton[primary="true"]:disabled,
         QPushButton[glass="true"]:checked:disabled {{ background: {SURFACE}; color: {DISABLED_TEXT}; }}
         QPushButton#nav {{ background: transparent; color: {MUTED}; padding: 0; }}
-        QPushButton#nav:hover {{ background: rgba(255, 255, 255, 10); color: {TEXT}; }}
-        QPushButton#nav:checked {{ background: {selection_fill}; color: {accent}; }}
+        QPushButton#nav:hover {{ background: transparent; color: {TEXT}; }}
+        QPushButton#nav:checked {{ background: transparent; color: {accent}; }}
         QPushButton#tab {{ background: transparent; color: {MUTED}; padding: 6px 14px; border-radius: {RADIUS_BUTTON}px; }}
         QPushButton#tab:hover {{ background: rgba(255, 255, 255, 10); color: {TEXT}; }}
         QPushButton#tab:checked {{ background: {selection_fill}; color: #FFFFFF; }}

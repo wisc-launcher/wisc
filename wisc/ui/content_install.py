@@ -15,7 +15,7 @@ from wisc.core.credentials import redact_credentials
 from wisc.mods.modpacks import PackInstaller, PackPlan
 from wisc.ui import theme as theme
 from wisc.mods.platform import ModPlatformClient
-from wisc.ui.components import GlassButton, GlassLineEdit, LauncherComboBox, text_label
+from wisc.ui.components import GlassButton, GlassLineEdit, LauncherComboBox, enable_smooth_scroll, text_label
 from wisc.ui.content import ContentAction, ContentImages, ContentItem, ContentList, format_size
 from wisc.ui.tasks import LatestServiceTask, ServiceRunner
 
@@ -88,6 +88,7 @@ class ReviewDialog(QDialog):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidgetResizable(True)
         scroll.viewport().setAutoFillBackground(False)
+        enable_smooth_scroll(scroll)
         self.content = QWidget()
         self.content.setObjectName("contentScrollBody")
         self.body = QVBoxLayout(self.content)

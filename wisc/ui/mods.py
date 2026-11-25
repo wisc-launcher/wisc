@@ -326,7 +326,7 @@ class ModsPage(QWidget):
         self.results.addWidget(self.list)
         self.skeleton = SkeletonList()
         self.results.addWidget(self.skeleton)
-        self.empty = GlassPanel(radius=theme.RADIUS_CARD)
+        self.empty = QWidget()
         empty = QVBoxLayout(self.empty)
         empty.setContentsMargins(32, 32, 32, 32)
         empty.addStretch()
@@ -840,7 +840,7 @@ class ModsPage(QWidget):
             was_list = self.results.currentWidget() is self.list
             self.results.setCurrentWidget(self.list)
             if not was_list:
-                self._reveal.reveal(self.list)
+                self.list.reveal_wave()
         elif loading and usable:
             self.results.setCurrentWidget(self.skeleton)
         else:

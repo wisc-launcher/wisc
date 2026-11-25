@@ -14,7 +14,9 @@ from wisc.mods.compatibility import version_supports_profile
 from wisc.core.credentials import redact_credentials
 from wisc.mods.manager import LocalMod, version_loader_compatible
 from wisc.ui import theme as theme
-from wisc.ui.components import ElidedLabel, GlassButton, GlassPanel, GlassLineEdit, LauncherComboBox, text_label
+from wisc.ui.components import (
+    ElidedLabel, GlassButton, GlassLineEdit, GlassPanel, LauncherComboBox, enable_smooth_scroll, text_label,
+)
 from wisc.ui.content import (
     ContentAction, ContentImage, ContentImages, ContentItem, ContentList,
     ContentMarkdown, ContentPagination, format_downloads, format_size,
@@ -135,6 +137,7 @@ class ContentDetails(QWidget):
         metadata_scroll.setFrameShape(QFrame.Shape.NoFrame)
         metadata_scroll.setWidgetResizable(True)
         metadata_scroll.viewport().setAutoFillBackground(False)
+        enable_smooth_scroll(metadata_scroll)
         self.metadata_host = QWidget()
         self.metadata_host.setObjectName("contentScrollBody")
         self.metadata_layout = QVBoxLayout(self.metadata_host)
@@ -191,6 +194,7 @@ class ContentDetails(QWidget):
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.gallery_scroll.viewport().setAutoFillBackground(False)
+        enable_smooth_scroll(self.gallery_scroll)
         self.gallery_body = QWidget()
         self.gallery_body.setObjectName("contentScrollBody")
         self.gallery_layout = QVBoxLayout(self.gallery_body)

@@ -1,12 +1,12 @@
 """Artwork and compact controls shared by the new Qt frontend."""
 
 from functools import lru_cache
-from math import ceil, hypot
+from math import ceil, exp, hypot
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import (
-    QAbstractAnimation, QEasingCurve, QEvent, QObject, QParallelAnimationGroup,
+    QAbstractAnimation, QEasingCurve, QElapsedTimer, QEvent, QObject, QParallelAnimationGroup,
     QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QTimer, QVariantAnimation,
 )
 from PyQt6.QtGui import (
@@ -14,9 +14,9 @@ from PyQt6.QtGui import (
     QPen, QPixmap, QRegion,
 )
 from PyQt6.QtWidgets import (
-    QAbstractButton, QAbstractItemView, QApplication, QComboBox, QFrame, QGraphicsBlurEffect,
-    QGraphicsOpacityEffect, QGraphicsScene, QLabel, QLineEdit, QListView, QMenu, QPushButton, QSizePolicy,
-    QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget,
+    QAbstractButton, QAbstractItemView, QAbstractScrollArea, QApplication, QComboBox, QFrame, QGraphicsBlurEffect,
+    QGraphicsOpacityEffect, QGraphicsPixmapItem, QGraphicsScene, QLabel, QLineEdit, QListView, QMenu, QPushButton,
+    QScrollArea, QScrollBar, QSizePolicy, QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget,
 )
 
 from wisc.ui import theme as theme
@@ -490,6 +490,7 @@ class _DropdownListView(QListView):
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setItemDelegate(_DropdownItemDelegate(selector, self))
         self.setStyleSheet(theme.DROPDOWN_STYLESHEET)
+        enable_smooth_scroll(self)
         self.clicked.connect(selector._choose_index)
         self.activated.connect(selector._choose_index)
 
@@ -694,6 +695,35 @@ class LauncherComboBox(QComboBox):
         painter.drawPath(arrow)
 
 
+@lru_cache(maxsize=24)
+def _cached_blur_pixmap(cache_key: int, width: int, height: int, radius: float, pixmap_ref: QPixmap) -> QPixmap:
+    """Blur a QPixmap once using QGraphicsBlurEffect and cache by cacheKey."""
+    if pixmap_ref.isNull():
+        return pixmap_ref
+    scene = QGraphicsScene()
+    item = QGraphicsPixmapItem(pixmap_ref)
+    effect = QGraphicsBlurEffect()
+    effect.setBlurRadius(radius)
+    effect.setBlurHints(QGraphicsBlurEffect.BlurHint.PerformanceHint)
+    item.setGraphicsEffect(effect)
+    scene.addItem(item)
+    out = QPixmap(pixmap_ref.size())
+    out.setDevicePixelRatio(pixmap_ref.devicePixelRatioF())
+    out.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    scene.render(painter, QRectF(0, 0, width, height), QRectF(0, 0, width, height))
+    painter.end()
+    return out
+
+
+def blur_pixmap(pixmap: QPixmap, radius: float = 18.0) -> QPixmap:
+    """Return a cached blurred copy of a QPixmap."""
+    if pixmap.isNull():
+        return pixmap
+    return _cached_blur_pixmap(pixmap.cacheKey(), pixmap.width(), pixmap.height(), radius, pixmap)
+
+
 def compose_profile_surface(artwork_path: str, icon_path: str, w: int, h: int, scale: float,
                             images: "ContentImages | None" = None) -> QPixmap:
     """Artwork/caption surface shared by shelf widgets and virtual library cards."""
@@ -716,8 +746,10 @@ def compose_profile_surface(artwork_path: str, icon_path: str, w: int, h: int, s
         icon = artwork_image(icon_path)
     else:
         artwork = images.get(artwork_path, 480)
-        frosted = images.get(frosted_path, 480)
+        frosted = images.get(frosted_path, 480) if bundled.is_file() else None
         icon = images.get(icon_path, 32)
+    if frosted is None and artwork is not None:
+        frosted = blur_pixmap(artwork, 18.0)
     if artwork is not None:
         draw_cover(p, artwork, bounds)
     caption = QRectF(bounds.left(), h - 60, bounds.width(), 59)
@@ -1104,3 +1136,257 @@ class StaggeredReveal(QObject):
 
     def _on_finished(self) -> None:
         self.stop()
+
+
+class _ScrollAxis:
+    """State for one smooth-scrolling scrollbar axis."""
+
+    def __init__(self, bar: QScrollBar):
+        self.bar = bar
+        self.current = float(bar.value())
+        self.target = float(bar.value())
+        self.active = False
+
+
+class SmoothScrollFilter(QObject):
+    """Exponential-glide scroll filter with 1:1 touchpad passthrough and keyboard support."""
+
+    def __init__(
+        self,
+        area: QAbstractScrollArea,
+        *,
+        step_px: float = 112.0,
+        decay: float = 14.5,
+    ):
+        super().__init__(area)
+        self._area = area
+        self._step_px = step_px
+        self._decay = decay
+        self._internal_set = False
+        self._elapsed = QElapsedTimer()
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self._axes: dict[Qt.Orientation, _ScrollAxis] = {
+            Qt.Orientation.Vertical: _ScrollAxis(area.verticalScrollBar()),
+            Qt.Orientation.Horizontal: _ScrollAxis(area.horizontalScrollBar()),
+        }
+        for axis in self._axes.values():
+            axis.bar.valueChanged.connect(lambda val, a=axis: self._on_bar_changed(a, val))
+            axis.bar.sliderPressed.connect(lambda a=axis: self._sync_axis(a))
+            axis.bar.rangeChanged.connect(lambda lo, hi, a=axis: self._on_range_changed(a, lo, hi))
+        area.viewport().installEventFilter(self)
+        area.installEventFilter(self)
+
+    def _set_bar_value(self, axis: _ScrollAxis, value: int) -> None:
+        if value != axis.bar.value():
+            self._internal_set = True
+            try:
+                axis.bar.setValue(value)
+            finally:
+                self._internal_set = False
+
+    def _tick(self) -> None:
+        dt = min(max(self._elapsed.restart() / 1000.0, 0.001), 0.05)
+        alpha = 1.0 - exp(-self._decay * dt)
+        any_active = False
+        for axis in self._axes.values():
+            if not axis.active:
+                continue
+            diff = axis.target - axis.current
+            if abs(diff) < 1.0:
+                axis.current = axis.target
+                axis.active = False
+            else:
+                axis.current += diff * alpha
+                any_active = True
+            self._set_bar_value(axis, round(axis.current))
+        if not any_active:
+            self._timer.stop()
+
+    def _ensure_running(self) -> None:
+        if not self._timer.isActive():
+            self._elapsed.start()
+            self._timer.start()
+
+    def _on_bar_changed(self, axis: _ScrollAxis, value: int) -> None:
+        if not self._internal_set:
+            axis.active = False
+            axis.current = float(value)
+            axis.target = float(value)
+            if not any(a.active for a in self._axes.values()):
+                self._timer.stop()
+
+    def _sync_axis(self, axis: _ScrollAxis) -> None:
+        axis.active = False
+        val = float(axis.bar.value())
+        axis.current = val
+        axis.target = val
+        if not any(a.active for a in self._axes.values()):
+            self._timer.stop()
+
+    def _on_range_changed(self, axis: _ScrollAxis, lo: int, hi: int) -> None:
+        f_lo, f_hi = float(lo), float(hi)
+        axis.current = min(max(axis.current, f_lo), f_hi)
+        axis.target = min(max(axis.target, f_lo), f_hi)
+
+    @staticmethod
+    def _has_range(axis: _ScrollAxis) -> bool:
+        return axis.bar.maximum() > axis.bar.minimum()
+
+    @staticmethod
+    def _at_boundary(axis: _ScrollAxis, delta_px: float) -> bool:
+        if delta_px > 0:
+            return axis.target <= axis.bar.minimum() and axis.bar.value() <= axis.bar.minimum()
+        if delta_px < 0:
+            return axis.target >= axis.bar.maximum() and axis.bar.value() >= axis.bar.maximum()
+        return True
+
+    def _apply_pixel_delta(self, axis: _ScrollAxis, delta_px: float) -> bool:
+        if delta_px == 0 or not self._has_range(axis):
+            return False
+        if self._at_boundary(axis, delta_px):
+            return False
+        axis.active = False
+        if not any(a.active for a in self._axes.values()):
+            self._timer.stop()
+        lo, hi = float(axis.bar.minimum()), float(axis.bar.maximum())
+        new_val = min(max(axis.current - delta_px, lo), hi)
+        axis.current = new_val
+        axis.target = new_val
+        self._set_bar_value(axis, round(new_val))
+        return True
+
+    def _glide_by(self, axis: _ScrollAxis, delta_px: float) -> bool:
+        if delta_px == 0 or not self._has_range(axis):
+            return False
+        if self._at_boundary(axis, delta_px):
+            return False
+        if not axis.active:
+            axis.current = float(axis.bar.value())
+            axis.target = axis.current
+        lo, hi = float(axis.bar.minimum()), float(axis.bar.maximum())
+        max_lead = max(float(axis.bar.pageStep()) * 2.5, 640.0)
+        new_target = min(max(axis.target - delta_px, lo), hi)
+        new_target = min(max(new_target, axis.current - max_lead), axis.current + max_lead)
+        axis.target = min(max(new_target, lo), hi)
+        axis.active = True
+        self._ensure_running()
+        return True
+
+    def _glide_to(self, axis: _ScrollAxis, target_val: float) -> bool:
+        if not self._has_range(axis):
+            return False
+        if not axis.active:
+            axis.current = float(axis.bar.value())
+        lo, hi = float(axis.bar.minimum()), float(axis.bar.maximum())
+        axis.target = min(max(target_val, lo), hi)
+        if abs(axis.target - axis.current) < 1.0:
+            return False
+        axis.active = True
+        self._ensure_running()
+        return True
+
+    def _handle_key_press(self, event: QEvent) -> bool:
+        if isinstance(self._area, _DropdownListView):
+            return False
+        if event.modifiers() != Qt.KeyboardModifier.NoModifier:
+            return False
+        key = event.key()
+        v_axis = self._axes[Qt.Orientation.Vertical]
+        h_axis = self._axes[Qt.Orientation.Horizontal]
+        page = float(max(v_axis.bar.pageStep() - 24, 48))
+
+        if key == Qt.Key.Key_PageDown:
+            return self._glide_by(v_axis, -page)
+        if key == Qt.Key.Key_PageUp:
+            return self._glide_by(v_axis, page)
+
+        if not isinstance(self._area, QScrollArea):
+            return False
+        if key == Qt.Key.Key_Down:
+            return self._glide_by(v_axis, -64.0)
+        if key == Qt.Key.Key_Up:
+            return self._glide_by(v_axis, 64.0)
+        if key == Qt.Key.Key_Right:
+            return self._glide_by(h_axis, -64.0)
+        if key == Qt.Key.Key_Left:
+            return self._glide_by(h_axis, 64.0)
+        if key == Qt.Key.Key_Home:
+            return self._glide_to(v_axis, float(v_axis.bar.minimum()))
+        if key == Qt.Key.Key_End:
+            return self._glide_to(v_axis, float(v_axis.bar.maximum()))
+        return False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        etype = event.type()
+        if etype not in (QEvent.Type.Wheel, QEvent.Type.KeyPress):
+            return False
+        try:
+            area = self._area
+            viewport = area.viewport()
+        except RuntimeError:
+            return False
+
+        if watched in (area, viewport) and etype == QEvent.Type.KeyPress:
+            if self._handle_key_press(event):
+                event.accept()
+                return True
+            return False
+
+        if watched is viewport and etype == QEvent.Type.Wheel:
+            pixel = event.pixelDelta()
+            if not pixel.isNull():
+                v_axis = self._axes[Qt.Orientation.Vertical]
+                h_axis = self._axes[Qt.Orientation.Horizontal]
+                handled = False
+                if pixel.y() != 0:
+                    target = v_axis if self._has_range(v_axis) else h_axis
+                    handled = self._apply_pixel_delta(target, float(pixel.y())) or handled
+                if pixel.x() != 0:
+                    handled = self._apply_pixel_delta(h_axis, float(pixel.x())) or handled
+                if handled:
+                    event.accept()
+                    return True
+                return False
+
+            angle = event.angleDelta()
+            v_axis = self._axes[Qt.Orientation.Vertical]
+            h_axis = self._axes[Qt.Orientation.Horizontal]
+            handled = False
+            if (
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                and angle.y() != 0
+                and angle.x() == 0
+                and self._has_range(h_axis)
+            ):
+                handled = self._glide_by(h_axis, (angle.y() / 120.0) * self._step_px)
+            else:
+                if angle.y() != 0:
+                    target = v_axis if self._has_range(v_axis) else h_axis
+                    handled = self._glide_by(target, (angle.y() / 120.0) * self._step_px) or handled
+                if angle.x() != 0:
+                    handled = self._glide_by(h_axis, (angle.x() / 120.0) * self._step_px) or handled
+            if handled:
+                event.accept()
+                return True
+            return False
+        return super().eventFilter(watched, event)
+
+
+def enable_smooth_scroll(
+    area: QAbstractScrollArea,
+    *,
+    step_px: float = 112.0,
+    decay: float = 14.5,
+) -> SmoothScrollFilter:
+    """Attach exponential-glide smooth scrolling to a QScrollArea, QListView, or QTextBrowser."""
+    existing = getattr(area, "_smooth_scroll_filter", None)
+    if isinstance(existing, SmoothScrollFilter):
+        return existing
+    if isinstance(area, QAbstractItemView):
+        area.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        area.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    filt = SmoothScrollFilter(area, step_px=step_px, decay=decay)
+    area._smooth_scroll_filter = filt
+    return filt

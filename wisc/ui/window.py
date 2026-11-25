@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QAbstractAnimation, QEasingCurve, QEvent, QPoint, QRectF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractButton, QApplication, QHBoxLayout, QLabel, QMainWindow,
@@ -82,6 +82,196 @@ class WindowButton(QAbstractButton):
             painter.drawRect(QRectF(15, 15, 10, 10))
 
 
+class _NavTabButton(QPushButton):
+    """Top navigation button with hover fade and smooth icon tint crossfade."""
+
+    def __init__(self, page: str, label: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._page = page
+        self._accent = theme.DEFAULT_ACCENT
+        self._hover_progress = 0.0
+        self._active_progress = 0.0
+        self._pixmaps: dict[tuple[str, float], QPixmap] = {}
+
+        self.setObjectName("nav")
+        self.setFixedSize(58, 38)
+        self.setIconSize(QSize(23, 23))
+        self.setToolTip(label)
+        self.setAccessibleName(label)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self._hover_anim = QVariantAnimation(self)
+        self._hover_anim.setDuration(140)
+        self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._hover_anim.valueChanged.connect(self._on_hover_step)
+
+        self._active_anim = QVariantAnimation(self)
+        self._active_anim.setDuration(220)
+        self._active_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._active_anim.valueChanged.connect(self._on_active_step)
+
+    def _on_hover_step(self, value: object) -> None:
+        self._hover_progress = float(value)
+        self.update()
+
+    def _on_active_step(self, value: object) -> None:
+        self._active_progress = float(value)
+        self.update()
+
+    def set_accent(self, accent: str) -> None:
+        if self._accent != accent:
+            self._accent = accent
+            self._pixmaps.clear()
+            self.update()
+
+    def set_active(self, active: bool, *, animate: bool = True) -> None:
+        self.setChecked(active)
+        target = 1.0 if active else 0.0
+        if not animate or not self.isVisible():
+            self._active_anim.stop()
+            self._active_progress = target
+            self.update()
+            return
+        if abs(target - self._active_progress) < 0.01 and self._active_anim.state() != QAbstractAnimation.State.Running:
+            return
+        self._active_anim.stop()
+        self._active_anim.setStartValue(self._active_progress)
+        self._active_anim.setEndValue(target)
+        self._active_anim.start()
+
+    def _pixmap_for(self, color: str, dpr: float) -> QPixmap:
+        key = (color, dpr)
+        cached = self._pixmaps.get(key)
+        if cached is not None:
+            return cached
+        pixmap = navigation_icon(self._page, color).pixmap(self.iconSize())
+        self._pixmaps[key] = pixmap
+        return pixmap
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover_progress)
+        self._hover_anim.setEndValue(1.0)
+        self._hover_anim.start()
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover_progress)
+        self._hover_anim.setEndValue(0.0)
+        self._hover_anim.start()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        focus_active = self.hasFocus() and bool(self.property("keyboardFocus"))
+        if self._hover_progress > 0.005 or focus_active:
+            alpha = max(round(10 * self._hover_progress), 14 if focus_active else 0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, alpha))
+            painter.drawRoundedRect(QRectF(self.rect()), theme.RADIUS_BUTTON, theme.RADIUS_BUTTON)
+
+        dpr = self.devicePixelRatioF()
+        muted_px = self._pixmap_for(MUTED, dpr)
+        accent_px = self._pixmap_for(self._accent, dpr)
+        size = self.iconSize()
+        target_rect = QRectF(
+            (self.width() - size.width()) / 2.0,
+            (self.height() - size.height()) / 2.0,
+            size.width(),
+            size.height(),
+        )
+
+        if self._active_progress < 0.995:
+            painter.setOpacity(1.0 - self._active_progress)
+            painter.drawPixmap(target_rect, muted_px, QRectF(muted_px.rect()))
+        if self._active_progress > 0.005:
+            painter.setOpacity(self._active_progress)
+            painter.drawPixmap(target_rect, accent_px, QRectF(accent_px.rect()))
+
+
+class _NavTabsBar(QWidget):
+    """Tab container painting the sliding active selection pill behind nav icons."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("tabs")
+        self.setFixedHeight(44)
+        self._accent = theme.DEFAULT_ACCENT
+        self._active_button: _NavTabButton | None = None
+        self._pill_x = 3.0
+        self._pill_width = 58.0
+        self._pill_initialized = False
+
+        self._pill_anim = QVariantAnimation(self)
+        self._pill_anim.setDuration(220)
+        self._pill_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._pill_anim.valueChanged.connect(self._on_pill_step)
+
+    def _on_pill_step(self, value: object) -> None:
+        self._pill_x = float(value)
+        self.update()
+
+    def set_accent(self, accent: str) -> None:
+        if self._accent != accent:
+            self._accent = accent
+            self.update()
+
+    def set_active_button(self, button: _NavTabButton, *, animate: bool = True) -> None:
+        self._active_button = button
+        target_x = float(button.x())
+        target_w = float(button.width() or 58)
+        if not animate or not self.isVisible() or not self._pill_initialized or button.width() <= 0:
+            self._pill_anim.stop()
+            self._pill_x = target_x
+            self._pill_width = target_w
+            self._pill_initialized = button.width() > 0
+            self.update()
+            return
+        if abs(target_x - self._pill_x) < 0.5 and self._pill_anim.state() != QAbstractAnimation.State.Running:
+            self._pill_x = target_x
+            self._pill_width = target_w
+            self.update()
+            return
+        self._pill_anim.stop()
+        self._pill_anim.setStartValue(self._pill_x)
+        self._pill_anim.setEndValue(target_x)
+        self._pill_width = target_w
+        self._pill_anim.start()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._active_button is not None and not self._pill_initialized:
+            self.set_active_button(self._active_button, animate=False)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._active_button is not None and self._pill_anim.state() != QAbstractAnimation.State.Running:
+            self._pill_x = float(self._active_button.x())
+            self._pill_width = float(self._active_button.width() or 58)
+            self._pill_initialized = self._active_button.width() > 0
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 4))
+        painter.drawRoundedRect(QRectF(self.rect()), 11.0, 11.0)
+        if self._active_button is not None:
+            pill = QColor(self._accent)
+            pill.setAlpha(46)
+            painter.setBrush(pill)
+            painter.drawRoundedRect(
+                QRectF(self._pill_x, 3.0, self._pill_width, 38.0),
+                float(theme.RADIUS_BUTTON),
+                float(theme.RADIUS_BUTTON),
+            )
+
+
 class TitleBar(GlassPanel):
     navigation_requested = pyqtSignal(str)
 
@@ -106,27 +296,18 @@ class TitleBar(GlassPanel):
         brand.addStretch(1)
         row.addWidget(branding)
         row.addStretch(1)
-        tabs = QWidget()
-        tabs.setObjectName("tabs")
-        tabs.setFixedHeight(44)
-        tab_layout = QHBoxLayout(tabs)
+        self._tabs = _NavTabsBar()
+        tab_layout = QHBoxLayout(self._tabs)
         tab_layout.setContentsMargins(3, 3, 3, 3)
         tab_layout.setSpacing(4)
-        self.buttons: dict[str, QPushButton] = {}
+        self.buttons: dict[str, _NavTabButton] = {}
         for page, label in (("home", "Home"), ("installations", "Library"),
                             ("mods", "Mods & Modpacks"), ("skins", "Skins"), ("options", "Options")):
-            button = QPushButton()
-            button.setObjectName("nav")
-            button.setFixedSize(58, 38)
-            button.setIconSize(QSize(23, 23))
-            button.setToolTip(label)
-            button.setAccessibleName(label)
-            button.setCheckable(True)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button = _NavTabButton(page, label)
             button.clicked.connect(lambda checked=False, key=page: self._request_navigation(key))
             self.buttons[page] = button
             tab_layout.addWidget(button)
-        row.addWidget(tabs)
+        row.addWidget(self._tabs)
         row.addStretch(1)
         controls = QWidget()
         controls.setFixedWidth(200)
@@ -146,16 +327,23 @@ class TitleBar(GlassPanel):
         self.set_current_page("home")
 
     def set_current_page(self, page: str) -> None:
+        changed = page != self._page
         self._page = page
         for key, button in self.buttons.items():
-            button.setChecked(key == page)
+            button.set_active(key == page, animate=changed)
             color = self._accent if key == page else MUTED
             if self._icon_colors.get(key) != color:
                 button.setIcon(navigation_icon(key, color))
                 self._icon_colors[key] = color
+        active = self.buttons.get(page)
+        if active is not None:
+            self._tabs.set_active_button(active, animate=changed)
 
     def apply_theme(self, colors: dict[str, str]) -> None:
         self._accent = colors["btn_primary"]
+        self._tabs.set_accent(self._accent)
+        for button in self.buttons.values():
+            button.set_accent(self._accent)
         self.set_current_page(self._page)
         for button in self.window_buttons.values():
             button._accent = self._accent

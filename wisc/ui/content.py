@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 from wisc.mods.markdown import normalize_mod_markdown
 from wisc.ui import theme as theme
 from wisc.ui.components import (
-    REVEAL_TOTAL_MS, GlassButton, GlassMenu, compose_profile_surface, paint_glass,
+    REVEAL_TOTAL_MS, GlassButton, GlassMenu, compose_profile_surface, enable_smooth_scroll, paint_glass,
     paint_profile_actions, paint_profile_caption, paint_switch,
     reveal_wave_sample, reveal_wave_window, text_label,
 )
@@ -226,9 +226,10 @@ class ContentItemDelegate(QStyledItemDelegate):
         ):
             painter.setFont(font)
             painter.setPen(QColor(color))
-            value = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, max(0, right - left))
+            single_line = " ".join(text.split())
+            value = painter.fontMetrics().elidedText(single_line, Qt.TextElideMode.ElideRight, max(0, right - left))
             painter.drawText(QRect(left, option.rect.y() + top, max(0, right - left), 20),
-                             Qt.AlignmentFlag.AlignVCenter, value)
+                             Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine, value)
         for action, rect in actions:
             enabled = action.enabled and self.view.actions_enabled
             if action.switch:
@@ -298,6 +299,7 @@ class ContentList(QListView):
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setMouseTracking(True)
         self.viewport().setAutoFillBackground(False)
+        enable_smooth_scroll(self)
         self.source = ContentListModel(self)
         self.proxy = ContentFilterModel(self)
         self.proxy.setSourceModel(self.source)
@@ -333,15 +335,9 @@ class ContentList(QListView):
         if self._wave_progress >= 1.0:
             return 1.0, 0.0
         vp = self.viewport()
-        ox = self._wave_origin.x()
-        oy = self._wave_origin.y()
-        max_dist = max(
-            hypot(max(abs(ox), abs(vp.width() - ox)), max(abs(oy), abs(vp.height() - oy))),
-            1.0,
-        )
-        center = rect.center()
-        dist = hypot(center.x() - ox, center.y() - oy)
-        start_t, span_t = reveal_wave_window(dist / max_dist)
+        height = max(float(vp.height()), 1.0)
+        ratio = max(0.0, min(1.0, rect.center().y() / height))
+        start_t, span_t = reveal_wave_window(ratio)
         return reveal_wave_sample(self._wave_progress, start_t, span_t)
 
     def _image_ready(self, key: str) -> None:
@@ -707,6 +703,7 @@ class ContentMarkdown(QTextBrowser):
         self.setOpenLinks(False)
         self.setOpenExternalLinks(False)
         self.viewport().setAutoFillBackground(False)
+        enable_smooth_scroll(self)
         self.images = images
         self._accent: QColor | None = None
         self._resources: dict[str, QUrl] = {}

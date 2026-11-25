@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout, QPushButton, QStyle,
     QVBoxLayout, QWidget,
@@ -18,7 +18,7 @@ from wisc.ui.components import (
     artwork_image, text_label,
 )
 from wisc.ui.images import ContentImages
-from wisc.ui.theme import DEFAULT_THEME, THEMES, ui_font
+from wisc.ui.theme import ui_font
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,6 @@ class HomePage(QWidget):
     create_requested = pyqtSignal()
     library_requested = pyqtSignal()
     logs_requested = pyqtSignal()
-    theme_requested = pyqtSignal(str)
     account_requested = pyqtSignal()
 
     def __init__(self, profiles: Sequence[HomeProfile], colors: dict[str, str], *,
@@ -67,17 +66,14 @@ class HomePage(QWidget):
         layout.setSpacing(0)
         account_row = QHBoxLayout()
         account_row.addStretch(1)
-        account = GlassButton(username.replace("&", "&&"))
-        face = artwork_image(str(ASSETS_DIR / "skins" / "default_steve.png")).copy(8, 8, 8, 8)
-        account.setIcon(QIcon(face.scaled(
-            24, 24, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation,
-        )))
-        account.setIconSize(QSize(24, 24))
-        account.setFixedHeight(theme.SEGMENT_HEIGHT)
-        account.setToolTip("Accounts")
-        account.setAccessibleName("Accounts")
-        account.clicked.connect(self.account_requested.emit)
-        account_row.addWidget(account)
+        self.account_button = GlassButton("")
+        self.account_button.setIconSize(QSize(24, 24))
+        self.account_button.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self.account_button.setToolTip("Accounts")
+        self.account_button.setAccessibleName("Accounts")
+        self.account_button.clicked.connect(self.account_requested.emit)
+        self.set_account(username)
+        account_row.addWidget(self.account_button)
         layout.addLayout(account_row)
 
         hero = QVBoxLayout()
@@ -154,13 +150,6 @@ class HomePage(QWidget):
         self.status.setFont(ui_font(theme.FONT_DETAIL))
         self.status.setProperty("muted", True)
         footer.addWidget(self.status, 1)
-        self.theme_picker = LauncherComboBox(height=theme.COMPACT_HEIGHT, min_width=120, max_width=180)
-        self.theme_picker.setAccessibleName("Launcher theme")
-        self.theme_picker.setToolTip("Theme")
-        self.theme_picker.addItems(THEMES.keys())
-        self.theme_picker.setCurrentText(DEFAULT_THEME)
-        self.theme_picker.currentTextChanged.connect(self.theme_requested.emit)
-        footer.addWidget(self.theme_picker)
         logs = GlassButton("Logs")
         logs.setFixedHeight(theme.COMPACT_HEIGHT)
         logs.clicked.connect(self.logs_requested.emit)
@@ -178,6 +167,17 @@ class HomePage(QWidget):
     @property
     def selected_profile(self) -> HomeProfile | None:
         return self._selected
+
+    def set_account(self, username: str, skin_path: Path | str | None = None) -> None:
+        name = (username or "Player").strip() or "Player"
+        self.account_button.setText("  " + name.replace("&", "&&"))
+        skin = artwork_image(str(skin_path)) if skin_path else QPixmap()
+        if skin.isNull():
+            skin = artwork_image(str(ASSETS_DIR / "skins" / "default_steve.png"))
+        face = skin.copy(8, 8, 8, 8)
+        self.account_button.setIcon(QIcon(face.scaled(
+            24, 24, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation,
+        )))
 
     def select_profile(self, profile_id: str) -> None:
         if self._busy:

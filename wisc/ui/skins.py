@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from wisc.ui import theme as theme
-from wisc.ui.components import ElidedLabel, GlassButton, GlassPanel, text_label
+from wisc.ui.components import ElidedLabel, GlassButton, GlassPanel, enable_smooth_scroll, text_label
 from wisc.ui.skin_viewer import SkinPreview
 from wisc.ui.tasks import LatestServiceTask, ServiceRunner
 from wisc.ui.theme import MUTED, ui_font
@@ -170,6 +170,7 @@ class SkinsPage(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll.viewport().setAutoFillBackground(False)
+        enable_smooth_scroll(self.scroll)
 
         scroll_content = QWidget()
         scroll_content.setObjectName("skinsContent")

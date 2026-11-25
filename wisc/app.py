@@ -136,6 +136,7 @@ class QtLauncherWindow(FramelessWindow):
         self._library_preload.setSingleShot(True)
         self._library_preload.timeout.connect(self._warm_library_modules)
         self._loading_page = None
+        self._pending_options_subpage: str | None = None
         self._requested_mod_profile = None
         self._launch_token: int | None = None
         self._launch_cancel: threading.Event | None = None
@@ -170,12 +171,12 @@ class QtLauncherWindow(FramelessWindow):
         self.launch_progress.connect(self.home.set_operation)
         self.home.operation_changed.connect(self._home_progress_changed)
         self.home.profile_selected.connect(self._selected_profile_changed)
-        self.home.theme_requested.connect(self.apply_theme)
         self.home.library_requested.connect(lambda: self.navigate("installations"))
         self.home.launch_requested.connect(self._launch_profile)
         self.home.cancel_requested.connect(self._cancel_launch)
         self.home.folder_requested.connect(self._open_profile_folder)
         self.home.account_requested.connect(self._open_accounts)
+        self._refresh_home_account()
         self.apply_theme(saved_theme)
 
     @property
@@ -268,6 +269,8 @@ class QtLauncherWindow(FramelessWindow):
         attribute = attributes[page]
         self.progress_host.set_operation("navigation", None)
         if page == "home" or getattr(self, "_" + attribute) is not None or attribute in self._prepared_modules:
+            if page == "home":
+                self._refresh_home_account()
             target_widget = getattr(self, attribute)
             self.pages.setCurrentWidget(target_widget)
             self._reveal.reveal(target_widget)
@@ -306,6 +309,10 @@ class QtLauncherWindow(FramelessWindow):
                 self.progress_host.set_operation("navigation", None)
                 try:
                     target_widget = getattr(self, attribute)
+                    if page == "options" and self._pending_options_subpage:
+                        subpage = self._pending_options_subpage
+                        self._pending_options_subpage = None
+                        target_widget.show_subpage(subpage, animate=False)
                     self.pages.setCurrentWidget(target_widget)
                     self._reveal.reveal(target_widget)
                 except Exception as error:
@@ -332,10 +339,43 @@ class QtLauncherWindow(FramelessWindow):
         if "library" not in self._prepared_modules:
             self._library_preload.start(75)
 
+    def _refresh_home_account(self) -> None:
+        account = get_active_account()
+        username = str(account.get("username") or "Player")
+        acc_type = str(account.get("type") or "offline")
+        skin_path: Path | None = None
+        try:
+            from wisc.services.skins import fetch_ely_skin, get_skins_dir, load_active_skin_choice
+            if acc_type == "ely":
+                clean = username.strip().lower()
+                ely_cache = get_skins_dir() / f"ely_{clean}.png"
+                if ely_cache.is_file():
+                    skin_path = ely_cache
+                elif clean:
+                    self.services.submit(
+                        lambda u=username: fetch_ely_skin(u),
+                        lambda _res, u=username, p=ely_cache: self.home.set_account(u, p) if (not self._closing and p.is_file()) else None,
+                    )
+            else:
+                choice = load_active_skin_choice()
+                custom = str(choice.get("custom_path") or "").strip()
+                if custom and Path(custom).is_file():
+                    skin_path = Path(custom)
+                elif choice.get("model") == "slim":
+                    slim = ASSETS_DIR / "skins" / "default_alex.png"
+                    if slim.is_file():
+                        skin_path = slim
+        except Exception:
+            pass
+        self.home.set_account(username, skin_path)
+
     def _open_accounts(self) -> None:
-        self.navigate("options")
         if self._options is not None:
+            self.navigate("options")
             self._options.show_subpage("options_accounts")
+        else:
+            self._pending_options_subpage = "options_accounts"
+            self.navigate("options")
 
     def _open_profile_folder(self, profile_id: str) -> None:
         raw = self._raw_profiles.get(profile_id)
