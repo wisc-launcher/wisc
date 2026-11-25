@@ -1,5 +1,5 @@
 The launcher keeps its restored classic structure with a
-Cubeon-inspired artwork background and dark glass shell.
+artwork background and dark glass shell.
 
 Keep its top navigation, Wisc logo and title, Home launch controls, library cards,
 compact profile rows, skin preview, and Options dashboard. Bundled official
@@ -18,6 +18,11 @@ for dense feature pages, including the margins and footer. Reuse pre-blurred cov
 surfaces, including the same window vignette, and clip their background layer
 without clipping foreground dialogs.
 The Home launch panel is transparent, with no backdrop blur or fill, while keeping its existing layout.
+In Qt, fade artwork from the sides and bottom, with no top fade. Home keeps the
+stronger shading; other tabs use 60% of Home's gradient strength over the selected
+frosted artwork, including their glass chrome and controls.
+Use one persistent bottom progress bar across Qt tabs, with status and cancellation
+for active operations and a quiet empty track when idle.
 
 The selected theme comes from wisc.core.themes.THEMES; Earth 2 is the
 default. It supplies accents for primary actions, selection, and keyboard focus.

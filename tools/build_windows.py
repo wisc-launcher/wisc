@@ -90,24 +90,24 @@ def build(version: str, compiler: Path | None) -> list[Path]:
     work_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Flet's pack command includes and brands its desktop client, then invokes
-    # PyInstaller. Keep its generated spec and temporary files under build/.
+    # Build the desktop bundle with PyInstaller, keeping its spec and
+    # temporary files under build/.
     command = [
-        sys.executable, "-m", "flet.cli", "pack", str(PROJECT_ROOT / "main.py"),
-        "--yes", "--onedir", "--name", APP_NAME,
+        sys.executable, "-m", "PyInstaller",
+        "--noconfirm", "--onedir", "--windowed",
+        "--name", APP_NAME,
         "--icon", str(assets / "icons" / "wisc.ico"),
-        "--product-name", "Wisc",
-        "--file-description", "Minecraft Java Edition launcher",
-        "--product-version", version,
-        "--file-version", f"{numeric_version}.0",
-        "--company-name", "Wisc",
         "--add-data", f"{assets}{os.pathsep}.assets",
         "--add-data", f"{bridge}{os.pathsep}tools/wisc-skin-bridge",
-        "--", "--clean",
+        "--distpath", str(work_dir / "dist"),
+        "--workpath", str(work_dir / "build"),
+        "--specpath", str(work_dir),
+        "--clean",
         "--paths", str(PROJECT_ROOT),
         "--collect-submodules", "minecraft_launcher_lib",
         "--collect-submodules", "keyring.backends",
         "--copy-metadata", "keyring",
+        str(PROJECT_ROOT / "main.py"),
     ]
     subprocess.run(command, cwd=work_dir, check=True)
 

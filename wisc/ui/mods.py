@@ -1,1441 +1,1596 @@
-"""Profile-scoped mods with Modrinth and CurseForge browsing."""
+"""Profile-scoped Qt content workspace backed by the existing mod services."""
 
 from __future__ import annotations
 
-import asyncio
-from copy import deepcopy
-import logging
+from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-import flet as ft
-from wisc.ui import theme
+from PyQt6.QtCore import QRectF, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath, QPen
+from PyQt6.QtWidgets import (
+    QButtonGroup, QFileDialog, QHBoxLayout,
+    QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+)
 
-from wisc.mods.manager import LocalMod, ModManager, ModrinthClient, ModUpdate, UpdateCheck, SUPPORTED_LOADERS, primary_file
+from wisc.core.credentials import redact_credentials
+from wisc.mods.content import ContentPackManager, LocalContentPack
+from wisc.ui import theme as theme
+from wisc.mods.manager import (
+    InstallPlan, LocalMod, ModManager, ModUpdate, SUPPORTED_LOADERS, UpdateCheck,
+    jar_base_name, newer_compatible_version, primary_content_file, primary_file,
+    version_matches_environment,
+)
+from wisc.mods.modpacks import PackInstaller, PackPlan
 from wisc.mods.platform import ModPlatformClient
-from wisc.ui.profiles import ProfileList, profile_list_surface, profile_row
-from wisc.ui.controls import (SimpleInput, AcrylicSelector, launcher_button, launcher_back_button,
-                          launcher_icon_button, rounded_artwork, format_size as _size,
-                          format_downloads as _downloads, search_input, card_surface, launcher_asset_icon,
-                          launcher_tab, select_tab)
-from wisc.ui.motion import StaggeredReveal
-from wisc.ui.mod_list import ModList
-from wisc.ui.mod_details import ModDetailsPage
-from wisc.ui.mod_install import ModInstallReview
-from wisc.ui.modpacks import CONTENT_OPTIONS, ModpacksPage
-from wisc.ui.content_packs import ContentPacksPage
-from wisc.ui.progress import ProgressHost, ProgressTask, track_progress
+from wisc.ui.components import ElidedLabel, GlassButton, GlassLineEdit, GlassPanel, LauncherComboBox, text_label
+from wisc.ui.content import (
+    ContentAction, ContentImages, ContentItem, ContentList, ContentPagination,
+    SkeletonList, format_downloads, format_size,
+)
+from wisc.ui.content_details import ContentDetails, RELEASE_OPTIONS
+from wisc.ui.content_install import (
+    ContentInstallReview, ModInstallReview, PackInstallReview, ReviewDialog, manual_ready_ids,
+)
+from wisc.ui.tasks import LatestServiceTask, OperationCancelled, ServiceProgress, ServiceRunner
 
 
-def _text(value: str, size: int = 13, *, color: str | None = None, emphasis: bool = False, **kwargs) -> ft.Text:
-    kwargs.setdefault("weight", ft.FontWeight.W_600 if emphasis else ft.FontWeight.NORMAL)
-    return ft.Text(value, size=size, color=theme.MUTED if color is None else color, **kwargs)
+CONTENT_OPTIONS = (("mods", "Mods"), ("modpacks", "Modpacks"), ("shader", "Shaders"), ("resourcepack", "Texture Packs"))
+SORT_OPTIONS = (("downloads", "Popular"), ("relevance", "Relevance"), ("newest", "Newest"), ("updated", "Updated"))
+PROFILE_KEYS = ("id", "minecraft_version", "loader", "loader_version", "version_id", "is_instance", "game_directory", "instance_name")
 
 
-def _button(label: str, on_click: Callable, *, primary: bool = False, **kwargs) -> ft.Button:
-    return launcher_button(label, on_click, primary=primary, **kwargs)
+def _saved_profiles() -> list[dict]:
+    from wisc.core.storage import load_installations
+    return load_installations()
 
 
-def _dropdown(options: list[tuple[str, str]], value: str | None, on_select: Callable, *, width: int = 160,
-              prefix: str | None = None) -> AcrylicSelector:
-    return AcrylicSelector(options, value, on_select, width=width, prefix=prefix)
+def _game_directory(profile: dict) -> Path:
+    from wisc.services.launcher import get_profile_game_directory
+    return get_profile_game_directory(profile)
 
 
-class ModsPage(ft.Container):
+def _runtime_directory() -> Path:
+    from wisc.services.launcher import minecraft_directory
+    return Path(minecraft_directory)
+
+
+def _is_running() -> bool:
+    from wisc.core.state import launcher_log_state
+    return bool(launcher_log_state["running"] or launcher_log_state["downloading"])
+
+
+def _profile_key(profile: dict | None) -> tuple:
+    return tuple((profile or {}).get(key) for key in PROFILE_KEYS)
+
+
+@dataclass
+class BrowseState:
+    query: str = ""
+    sort: str = "downloads"
+    offset: int = 0
+    total: int = 0
+    hits: list[dict] = field(default_factory=list)
+    loaded_key: tuple | None = None
+    scroll: int = 0
+
+
+class _RefreshButton(GlassButton):
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(theme.TEXT if self.isEnabled() else theme.DISABLED_TEXT)
+        painter.setPen(QPen(color, theme.STROKE_ICON, Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        cx, cy = self.width() / 2, self.height() / 2
+        arc_rect = QRectF(cx - 7, cy - 7, 14, 14)
+        painter.drawArc(arc_rect, 45 * 16, 280 * 16)
+        head = QPainterPath()
+        head.moveTo(cx + 2.5, cy - 7.5)
+        head.lineTo(cx + 6.5, cy - 6.5)
+        head.lineTo(cx + 5.5, cy - 2.5)
+        painter.drawPath(head)
+
+
+class ModsPage(QWidget):
+    content_changed = pyqtSignal()
+    profile_requested = pyqtSignal(str, str)
+    progress_changed = pyqtSignal(str, object, object, bool)
+    loading_changed = pyqtSignal(bool)
+
     PAGE_SIZE = 20
-    ROW_CACHE_SIZE = 64
 
-    def __init__(
-        self, page: ft.Page, *, get_profiles: Callable[[], list[dict]],
-        selected_profile: Callable[[], dict | None], game_directory: Callable[[dict], Path],
-        is_running: Callable[[], bool], notify: Callable, dialogs: Callable,
-        open_folder: Callable[[Path], None], create_profile: Callable[[], None],
-        profile_icon: Callable[[dict], ft.Control], on_changed: Callable[[], None],
-        client: ModrinthClient | None = None,
-        profile_badges: Callable[[dict], list[ft.Control]] | None = None,
-        profile_details: Callable[[dict], str] | None = None,
-        progress: ProgressHost | None = None,
-        entrance: StaggeredReveal | None = None,
-        runtime_directory: Path | None = None,
-        on_play: Callable[[dict], None] | None = None,
-    ):
-        self._page = page
-        self._get_profiles = get_profiles
-        self._selected_profile = selected_profile
-        self._game_directory = game_directory
-        self._runtime_directory = runtime_directory
-        self._is_running = is_running
-        self._show_notification = notify
-        self._dialogs = dialogs
-        self._open_folder = open_folder
-        self._create_profile = create_profile
-        self._profile_icon = profile_icon
-        self._profile_badges = profile_badges or (lambda profile: [])
-        self._profile_details = profile_details or (lambda profile: " • ".join(
-            str(value) for value in (profile.get("loader"), profile.get("minecraft_version")) if value))
-        self._on_changed = on_changed
-        self._progress = progress
-        self._entrance = entrance
-        self._pending_load: tuple | None = None
-        self._load_activity: ProgressTask | None = None
-        self._artwork_activities: set[ProgressTask] = set()
+    def __init__(self, runner: ServiceRunner, colors: dict[str, str], parent: QWidget | None = None, *,
+                 get_profiles: Callable[[], list[dict]] = _saved_profiles,
+                 selected_profile: Callable[[], str | None] = lambda: None,
+                 game_directory: Callable[[dict], Path] = _game_directory,
+                 is_running: Callable[[], bool] = _is_running,
+                 runtime_directory: Path | None = None, client: ModPlatformClient | None = None,
+                 pack_installer: PackInstaller | None = None):
+        super().__init__(parent)
+        self.runner = runner
         self.client = client or ModPlatformClient()
-        self.provider = "modrinth"
-        self._provider_states: dict[str, tuple] = {}
+        self._get_profiles, self._selected_profile = get_profiles, selected_profile
+        self._game_directory, self._is_running = game_directory, is_running
+        self._runtime_directory = runtime_directory
+        self._pack_installer = pack_installer
+        self._managers: OrderedDict[Path, ModManager] = OrderedDict()
+        self._content_managers: OrderedDict[tuple[Path, str], ContentPackManager] = OrderedDict()
+        self._profiles: list[dict] = []
         self.profile: dict | None = None
         self.manager: ModManager | None = None
-        self._managers: dict[Path, ModManager] = {}
-        self.view = "installed"
-        self.content_type = "mods"
-        self.queries = {"installed": "", "browse": ""}
+        self.content_manager: ContentPackManager | None = None
         self.local_mods: list[LocalMod] = []
-        self.hits: list[dict] = []
-        self.total_hits = 0
-        self.search_offset = 0
-        self.busy = False
-        self.loading = False
-        self.error = ""
-        self._generation = 0
-        self._active = False
-        self._undo: tuple[ModManager, str, str] | None = None
-        self._row_cache: dict[tuple, tuple[object, ft.Container]] = {}
-        self._project_cache: dict[str, dict] = {}
-        self._project_requests: set[str] = set()
-        self._details_open = False
-        self._selection_open = False
-        self._saved_scroll = 0.0
+        self.local_packs: list[LocalContentPack] = []
         self._updates: dict[str, ModUpdate] = {}
         self._update_summary = ""
-        self._update_filters: dict[tuple, str] = {}
-        self.checking_updates = False
-        self._update_activity: ProgressTask | None = None
-
-        self.heading = _text("Mods", 24, color=theme.TEXT, emphasis=True)
-        self.content_selector = AcrylicSelector(CONTENT_OPTIONS, "mods", self._content_changed,
-                                                width=160, tooltip="Content type")
-        self.select_profile_button = _button(
-            "Select Profile", lambda e: self.open_profile_selection(),
-            tooltip="Select Profile", height=52, width=280,
-        )
-        self.context = ft.Container(content=self.select_profile_button, width=280)
-        self._render_profile_header()
-        self.header = ft.Row([
-            self.heading, self.content_selector, ft.Container(expand=True), self.context,
-        ], spacing=16, vertical_alignment=ft.CrossAxisAlignment.CENTER)
-        self.installed_tab = launcher_tab("Installed", lambda e: self.set_view("installed"))
-        self.browse_tab = launcher_tab("Discover", lambda e: self.set_view("browse"))
-        self.attribution = _text("Powered by Modrinth", 11)
-        self.update_button = _button("Check updates", self._updates_action)
-        self.tabs = ft.Row([
-            self.browse_tab, self.installed_tab, ft.Container(expand=True), self.update_button, self.attribution,
-        ], spacing=8)
-        self.search = search_input("Search mods", on_change=self._search_changed, on_submit=self._search_submitted)
-        self.filter = _dropdown([("all", "All mods"), ("enabled", "Enabled"), ("disabled", "Disabled")], "all", self._filter_changed, width=150)
-        self.sort = _dropdown([("downloads", "Popular"), ("relevance", "Relevance"), ("updated", "Recently updated"), ("newest", "Newest")],
-                              "downloads", self._sort_changed, width=212, prefix="Sort:")
-        self.sort.tooltip = "Sort mods"
-        self.provider_selector = _dropdown([("modrinth", "Modrinth"), ("curseforge", "CurseForge")],
-                                           "modrinth", self._provider_changed, width=160)
-        self.provider_selector.tooltip = "Mod provider"
-        self.curseforge_setup_button = launcher_icon_button(
-            icon=ft.Icons.KEY_SHARP, icon_color=theme.ACCENT, icon_size=20,
-            tooltip="Set up CurseForge API key", on_click=self._configure_curseforge,
-        )
-        self.add_button = _button("Add JARs", self._import_files, primary=True)
-        self.refresh_button = launcher_icon_button(
-            icon=ft.Icons.REFRESH_SHARP, icon_color=theme.ACCENT, icon_size=20,
-            tooltip="Refresh mods", on_click=self._refresh_requested,
-        )
-        self.toolbar = ft.Row([self.search, self.filter, self.provider_selector, self.sort,
-                               self.curseforge_setup_button, self.add_button, self.refresh_button], spacing=12)
-        self.status = _text("", 12, expand=True)
-        self.list_view = ModList(self._cache_live_rows)
-        # Animate a stable body; row reconciliation resets drag animations.
-        self.list_body = ft.Container(expand=True, content=self.list_view)
-        self.list_host = profile_list_surface(self.list_body)
-        self.previous = launcher_icon_button(icon=ft.Icons.CHEVRON_LEFT_SHARP, tooltip="Previous page", on_click=lambda e: self._paginate(-1))
-        self.next = launcher_icon_button(icon=ft.Icons.CHEVRON_RIGHT_SHARP, tooltip="Next page", on_click=lambda e: self._paginate(1))
-        self.page_label = _text("")
-        self.pagination = ft.Row([
-            self.previous, self.page_label, self.next,
-        ], spacing=6, tight=True)
-        self.status_row = ft.Row([
-            self.status, self.pagination,
-        ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER)
-        self.file_picker = ft.FilePicker()
-        page.services.append(self.file_picker)
-        self.listing = ft.Container(expand=True, content=ft.Column(
-                expand=True, spacing=12,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                controls=[self.header, self.tabs, self.toolbar,
-                          self.status_row, self.list_host],
-            ))
-        self.details_page = ModDetailsPage(
-            page, client=self.client, get_profile=lambda: self.profile, get_manager=lambda: self.manager,
-            can_change=lambda: self._compatible() and not self._operation_in_progress and not self._is_running(),
-            on_back=self.close_details,
-            on_install=lambda hit, version: self._page.run_task(self._prepare_install, hit, version, self.details_page._profile_id),
-            on_toggle=lambda mod, manager: self._page.run_task(self._toggle, mod, not mod.enabled, manager),
-            on_remove=lambda mod, manager: self._confirm_remove(mod, manager),
-            progress=progress, on_release_filter_changed=lambda: self._update_release_filter(None),
-        )
-        self.details_host = ft.Container(expand=True, visible=False, content=self.details_page)
-        self.selection_heading = ft.Row([
-            launcher_back_button(lambda e: self.close_profile_selection(), tooltip="Back to Mods"),
-            _text("Select Profile", 24, color=theme.TEXT, emphasis=True),
-        ], spacing=12)
-        self.selection_note = _text("Choose the profile whose mods you want to manage.")
-        self.selection_list = ProfileList(on_order_changed=lambda ids: False)
-        self.selection_surface = profile_list_surface(self.selection_list)
-        self.selection_host = ft.Container(expand=True, visible=False, content=ft.Column([
-            self.selection_heading, self.selection_note, self.selection_surface,
-        ], expand=True, spacing=12, horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
-        self.mods_host = ft.Stack([self.listing, self.details_host, self.selection_host], expand=True)
-        self.modpacks_page = ModpacksPage(
-            page, get_profiles=get_profiles, is_running=is_running, notify=notify, dialogs=dialogs,
-            open_folder=open_folder, on_changed=on_changed, on_play=on_play,
-            on_manage_mods=lambda profile: self.enter(profile["id"]),
-            on_content_change=self._content_changed, configure_curseforge=self._configure_curseforge,
-            client=self.client, runtime_directory=runtime_directory,
-            other_busy=lambda: self._mods_busy or self.checking_updates, progress=progress, entrance=entrance,
-        )
-        self.content_packs_page = ContentPacksPage(
-            page, client=self.client, get_profiles=get_profiles, selected_profile=selected_profile,
-            game_directory=game_directory, is_running=is_running, notify=notify, dialogs=dialogs,
-            open_folder=open_folder, on_changed=on_changed, on_content_change=self._content_changed,
-            configure_curseforge=self._configure_curseforge,
-            other_busy=lambda: self._mods_busy or self.modpacks_page.busy or self.checking_updates,
-            progress=progress, entrance=entrance,
-        )
-        super().__init__(expand=True, padding=ft.Padding.only(left=28, right=28, top=20, bottom=16),
-                         content=ft.Stack([self.mods_host, self.modpacks_page, self.content_packs_page], expand=True))
-        self.list_reveal = StaggeredReveal(page, self.list_host)
-        self.selection_reveal = StaggeredReveal(page, self.selection_host)
-        self._render()
-
-    @property
-    def busy(self) -> bool:
-        packs = getattr(self, "modpacks_page", None)
-        content = getattr(self, "content_packs_page", None)
-        return self._mods_busy or bool(packs and packs.busy) or bool(content and content.busy)
-
-    @busy.setter
-    def busy(self, value: bool) -> None:
-        self._mods_busy = value
-
-    def _content_changed(self, e) -> None:
-        selector = (self.modpacks_page.content_selector if self.content_type == "modpacks" else
-                    self.content_packs_page.content_selector if self.content_type in {"shader", "resourcepack"} else self.content_selector)
-        self.set_content_type(selector.value)
-
-    def set_content_type(self, kind: str) -> None:
-        if kind not in dict(CONTENT_OPTIONS) or kind == self.content_type:
-            return
-        if self._operation_in_progress:
-            self.content_selector.refresh_options(CONTENT_OPTIONS, self.content_type)
-            self.modpacks_page.content_selector.refresh_options(CONTENT_OPTIONS, self.content_type)
-            self.content_packs_page.content_selector.refresh_options(CONTENT_OPTIONS, self.content_type)
-            self._update()
-            return
-        active = self._active
-        self.leave()
-        self.content_type = kind
-        self.mods_host.visible = kind == "mods"
-        self.modpacks_page.visible = kind == "modpacks"
-        self.content_packs_page.visible = kind in {"shader", "resourcepack"}
-        self.content_selector.refresh_options(CONTENT_OPTIONS, kind)
-        self.modpacks_page.content_selector.refresh_options(CONTENT_OPTIONS, kind)
-        self.content_packs_page.content_selector.refresh_options(CONTENT_OPTIONS, kind)
-        if active:
-            self.enter()
-        self._render()
-        self._update()
-
-    @property
-    def _operation_in_progress(self) -> bool:
-        return self.busy or self.checking_updates
-
-    @property
-    def reveal_controls(self) -> list[ft.Control]:
-        if self.content_type in {"shader", "resourcepack"}:
-            return self.content_packs_page.reveal_controls
-        if self.content_type == "modpacks":
-            return self.modpacks_page.reveal_controls
-        if self._selection_open:
-            return [self.selection_heading, self.selection_note, self.selection_surface]
-        if self._details_open:
-            return self.details_page.reveal_controls
-        return [self.header, self.tabs, self.toolbar, self.list_host]
-
-    def did_mount(self) -> None:
-        # The surrounding Home view can still be removed by a full-page route.
-        # Restore a deep scroll after the client has actually mounted the list.
-        if self.content_type != "mods":
-            return
-        if self._active and self._saved_scroll and not self._details_open and not self._selection_open:
-            self._page.run_task(self._restore_scroll, self._generation, self._saved_scroll)
-
-    def _update(self) -> None:
-        if self._active:
-            try:
-                # Cached pages can retain a Page reference after navigation.
-                # Prepare their state without patching an unmounted client ID.
-                if self.page.session.index.get(self._i) is not self:
-                    return
-                self.update()
-            except RuntimeError:
-                pass
-
-    def enter(self, profile_id: str | None = None, *, defer_load: bool = False) -> None:
-        if profile_id and self.content_type != "mods":
-            if self._operation_in_progress:
-                return
-            self.leave()
-            self.content_type = "mods"
-            self.mods_host.visible = True
-            self.modpacks_page.visible = False
-            self.content_packs_page.visible = False
-            self.content_selector.refresh_options(CONTENT_OPTIONS, "mods")
-            self.modpacks_page.content_selector.refresh_options(CONTENT_OPTIONS, "mods")
-            self.content_packs_page.content_selector.refresh_options(CONTENT_OPTIONS, "mods")
-            self._active = False
-        if self.content_type in {"shader", "resourcepack"}:
-            self._active = True
-            self.content_packs_page.enter(self.content_type, defer_load=defer_load)
-            return
-        if self.content_type == "modpacks":
-            self._active = True
-            self.modpacks_page.enter(defer_load=defer_load)
-            return
-        if not self._active:
-            # A cached native scroll viewport can retain an empty painted
-            # window after its parent fades back in. Recreate the viewport
-            # on return, retaining the bounded row cache and saved scroll.
-            self.list_view.reset_viewport()
-        self._active = True
-        profiles = self._get_profiles()
-        desired = profile_id or (self.profile or {}).get("id") or (self._selected_profile() or {}).get("id")
-        target = next((item for item in profiles if item.get("id") == desired), None)
-        if target is None:
-            target = next((item for item in profiles if str(item.get("loader", "")).lower() in SUPPORTED_LOADERS), profiles[0] if profiles else None)
-        self._set_profile(target, defer_load=defer_load)
-        if profile_id:
-            self.close_profile_selection()
-            self.close_details()
-        elif self._selection_open:
-            self._render_profile_selection()
-        elif self._details_open:
-            self.details_page.resume()
-        if self._saved_scroll:
-            self._page.run_task(self._restore_scroll, self._generation, self._saved_scroll)
-
-    def leave(self) -> None:
-        if self.content_type in {"shader", "resourcepack"}:
-            self.content_packs_page.leave()
-            self._active = False
-            return
-        if self.content_type == "modpacks":
-            self.modpacks_page.leave()
-            self._active = False
-            return
-        self._finish_update_activity()
+        self._release = "release"
+        self._release_choices: dict[tuple, str] = {}
+        self.kind = "mods"
+        self.provider = "modrinth"
+        self.view = "browse"
+        self._modes = {key: "browse" for key, _ in CONTENT_OPTIONS}
+        self._browse: dict[tuple[str, str], BrowseState] = {}
+        self._installed_queries: dict[str, str] = {}
+        self._installed_scrolls: dict[str, int] = {}
+        self._profile_error = ""
+        self._load_error = ""
         self._active = False
-        self._generation += 1
-        self.loading = False
-        self._pending_load = None
-        self._finish_load_activity()
-        for activity in self._artwork_activities:
-            activity.finish()
-        self._artwork_activities.clear()
-        self._saved_scroll = self.list_view._scroll_pixels
-        self.list_reveal.finish(update=False)
-        self.selection_reveal.finish(update=False)
-        self.details_page.suspend()
+        self._loaded_profiles = False
+        self._loading = False
+        self._scanning = False
+        self._loading_profiles = False
+        self._checking = False
+        self._busy = False
+        self._closing = False
+        self._phase = "idle"
+        self._review: ReviewDialog | None = None
+        self._progress: ServiceProgress | None = None
+        self._operation_token: int | None = None
+        self._undo: tuple[ModManager, str, str] | None = None
+        self._pack_plan: PackPlan | None = None
+        self._updating_list = False
+        self._desired_id: str | None = None
+        self._explicit_profile = False
+        self._details = None
+        self._detail_item: ContentItem | None = None
+        self._detail_loaded = False
+        self._profile_task = LatestServiceTask(runner)
+        self._context_task = LatestServiceTask(runner)
+        self._scan_task = LatestServiceTask(runner)
+        self._identity_task = LatestServiceTask(runner)
+        self._search_task = LatestServiceTask(runner)
+        self._details_task = LatestServiceTask(runner)
+        self._changelog_task = LatestServiceTask(runner)
+        self._check_task = LatestServiceTask(runner)
+        self._read_tasks = (self._profile_task, self._context_task, self._scan_task, self._identity_task,
+                            self._search_task, self._details_task, self._changelog_task, self._check_task)
+        self.images = ContentImages(runner, self)
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(350)
+        self._debounce.timeout.connect(self._load_browse)
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(lambda: self._notify(""))
+        self._build_ui()
+        self.apply_theme(colors)
 
-    def _render_profile_header(self) -> None:
-        profile = self.profile or {"name": "Choose a profile"}
-        summary = " · ".join(str(value) for value in (
-            profile.get("loader"), profile.get("minecraft_version")) if value)
-        self.select_profile_button.content = ft.Row([
-            rounded_artwork(self._profile_icon(profile), size=32),
-            ft.Column([
-                _text(profile.get("name", "Unnamed profile"), 14, color=theme.TEXT_HEADING, emphasis=True,
-                      max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                _text(summary or "Select an instance", 11, max_lines=1,
-                      overflow=ft.TextOverflow.ELLIPSIS),
-            ], expand=True, spacing=1, tight=True),
-            ft.Icon(ft.Icons.EXPAND_MORE_SHARP, size=18, color=theme.ACCENT),
-        ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
-        self.select_profile_button.style.bgcolor = {
-            ft.ControlState.DEFAULT: theme.SURFACE,
-            ft.ControlState.HOVERED: theme.CARD_HOVER,
-        }
+    @property
+    def details(self):
+        if self._details is None:
+            self._details = ContentDetails(self.images)
+            self._details.back_requested.connect(self.close_details)
+            self._details.retry_requested.connect(lambda: self._load_details(fresh=True))
+            self._details.install_requested.connect(self._prepare_install)
+            self._details.action_requested.connect(self._row_action)
+            self._details.release_changed.connect(self._release_changed)
+            self._details.link_requested.connect(self._open_link)
+            self._details.version_opened.connect(self._load_changelog)
+            self.body.addWidget(self._details)
+            self._details.apply_theme(self._colors)
+        return self._details
 
-    def _profile_row(self, profile: dict, actions: list[ft.Control], *, selected=False,
-                     on_select: Callable | None = None) -> ft.Container:
-        def body(icon, info):
-            return ft.GestureDetector(
-                content=ft.Row([icon, info], spacing=12,
-                               vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                expand=True, mouse_cursor=ft.MouseCursor.CLICK, on_tap=on_select,
-            )
-        return profile_row(
-            profile, icon=self._profile_icon(profile), badges=self._profile_badges(profile),
-            details=self._profile_details(profile), actions=actions, glow_color=theme.ACCENT,
-            selected=selected, body_builder=body if on_select else None,
-        )
+    @property
+    def browse_state(self) -> BrowseState:
+        return self._browse.setdefault((self.kind, self.provider), BrowseState())
 
-    def _render_profile_selection(self) -> None:
-        cards = []
-        for profile in self._get_profiles():
-            pid = profile["id"]
-            selected = pid == (self.profile or {}).get("id")
-            choose = lambda e, profile_id=pid: self.select_profile(profile_id)
-            card = ft.Container(
-                key=ft.ValueKey(f"mods-profile-{pid}"), data=pid,
-                margin=ft.Margin.only(bottom=8),
-                animate=ft.Animation(180, ft.AnimationCurve.EASE_OUT_CUBIC),
-                content=self._profile_row(profile, [
-                    _button("Selected" if selected else "Select", choose,
-                            disabled=selected or self._operation_in_progress),
-                ], selected=selected, on_select=choose),
-            )
-            cards.append(card)
-        self.selection_list.set_cards(cards, footer=None if cards else ft.Container(
-            padding=24, content=_text("No profiles yet. Create an instance in Library to get started.")), update=False)
+    @property
+    def can_cancel_operation(self) -> bool:
+        return self._progress is not None and self._progress.cancelable
 
-    def open_profile_selection(self) -> None:
-        if self._operation_in_progress or self._details_open or self._selection_open:
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(*theme.PAGE_MARGINS)
+        layout.setSpacing(12)
+        header_bar = QWidget()
+        header_bar.setFixedHeight(theme.HEADER_HEIGHT)
+        header = QHBoxLayout(header_bar)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(12)
+        self.heading = text_label("Mods", theme.FONT_PAGE_TITLE, bold=True)
+        header.addWidget(self.heading)
+        self.content_selector = LauncherComboBox(height=theme.BUTTON_HEIGHT, min_width=155, max_width=200)
+        self.content_selector.setAccessibleName("Content type")
+        for key, label in CONTENT_OPTIONS:
+            self.content_selector.addItem(label, key)
+        self.content_selector.currentIndexChanged.connect(self._kind_changed)
+        header.addWidget(self.content_selector)
+        header.addStretch()
+        self.profile_selector = LauncherComboBox(height=theme.BUTTON_HEIGHT, min_width=240, max_width=320)
+        self.profile_selector.setAccessibleName("Target profile; independent of Play selection")
+        self.profile_selector.setPlaceholderText("Choose a profile")
+        self.profile_selector.currentIndexChanged.connect(self._profile_selected)
+        header.addWidget(self.profile_selector)
+        layout.addWidget(header_bar)
+        self.body = QStackedWidget()
+        layout.addWidget(self.body, 1)
+        self.listing = QWidget()
+        listing = QVBoxLayout(self.listing)
+        listing.setContentsMargins(0, 0, 0, 0)
+        listing.setSpacing(12)
+        tabs = QHBoxLayout()
+        tabs.setSpacing(8)
+        self._tab_group = QButtonGroup(self)
+        self.discover = QPushButton("Discover")
+        self.installed = QPushButton("Installed")
+        for button, view in ((self.discover, "browse"), (self.installed, "installed")):
+            button.setObjectName("tab")
+            button.setCheckable(True)
+            button.setFixedHeight(theme.SEGMENT_HEIGHT)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._tab_group.addButton(button)
+            button.clicked.connect(lambda checked=False, name=view: self.set_view(name))
+            tabs.addWidget(button)
+        self.discover.setChecked(True)
+        tabs.addStretch()
+        self.attribution = text_label("Powered by Modrinth", theme.FONT_DETAIL, muted=True)
+        tabs.addWidget(self.attribution)
+        listing.addLayout(tabs)
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        self.search = GlassLineEdit(search_icon=True)
+        self.search.setClearButtonEnabled(True)
+        self.search.setAccessibleName("Search content")
+        self.search.setFixedHeight(theme.FIELD_HEIGHT)
+        self.search.setMinimumWidth(180)
+        self.search.textChanged.connect(self._query_changed)
+        self.search.returnPressed.connect(self._submit_search)
+        tools.addWidget(self.search, 1)
+        self.provider_selector = LauncherComboBox(height=theme.FIELD_HEIGHT, min_width=138, max_width=170)
+        self.provider_selector.addItem("Modrinth", "modrinth")
+        self.provider_selector.addItem("CurseForge", "curseforge")
+        self.provider_selector.setAccessibleName("Content provider")
+        self.provider_selector.currentIndexChanged.connect(self._provider_changed)
+        tools.addWidget(self.provider_selector)
+        self.sort = LauncherComboBox(height=theme.FIELD_HEIGHT, min_width=150, max_width=195, prefix="Sort:")
+        self.sort.setAccessibleName("Sort discoveries")
+        for key, label in SORT_OPTIONS:
+            self.sort.addItem(label, key)
+        self.sort.currentIndexChanged.connect(self._sort_changed)
+        tools.addWidget(self.sort)
+        self.state_filter = LauncherComboBox(height=theme.FIELD_HEIGHT, min_width=126, max_width=160)
+        for key, label in (("all", "All mods"), ("enabled", "Enabled"), ("disabled", "Disabled")):
+            self.state_filter.addItem(label, key)
+        self.state_filter.setAccessibleName("Filter installed mods")
+        self.state_filter.currentIndexChanged.connect(self._filter_installed)
+        tools.addWidget(self.state_filter)
+        self.release_filter = LauncherComboBox(height=theme.FIELD_HEIGHT, min_width=130, max_width=165)
+        self.release_filter.setAccessibleName("Release type for mod updates")
+        for key, label in RELEASE_OPTIONS:
+            self.release_filter.addItem(label, key)
+        self.release_filter.currentIndexChanged.connect(lambda: self._release_changed(self.release_filter.currentData()))
+        tools.addWidget(self.release_filter)
+        self.add = GlassButton("Add JARs")
+        self.add.setFixedHeight(theme.FIELD_HEIGHT)
+        self.add.clicked.connect(self._add_files)
+        tools.addWidget(self.add)
+        self.updates = GlassButton("Check updates")
+        self.updates.setFixedHeight(theme.FIELD_HEIGHT)
+        self.updates.setMinimumWidth(132)
+        self.updates.clicked.connect(self._updates_action)
+        tools.addWidget(self.updates)
+        self.key_button = GlassButton("API key")
+        self.key_button.setFixedHeight(theme.FIELD_HEIGHT)
+        self.key_button.clicked.connect(self._configure_curseforge)
+        tools.addWidget(self.key_button)
+        self.refresh_button = _RefreshButton()
+        self.refresh_button.setFixedSize(theme.FIELD_HEIGHT, theme.FIELD_HEIGHT)
+        self.refresh_button.setToolTip("Refresh")
+        self.refresh_button.setAccessibleName("Refresh")
+        self.refresh_button.clicked.connect(self.refresh)
+        tools.addWidget(self.refresh_button)
+        listing.addLayout(tools)
+        status_bar = QHBoxLayout()
+        status_bar.setContentsMargins(0, 0, 0, 0)
+        status_bar.setSpacing(12)
+        self.status = ElidedLabel()
+        self.status.setProperty("muted", True)
+        self.status.setFixedHeight(28)
+        status_bar.addWidget(self.status, 1)
+        self.pagination = ContentPagination()
+        self.pagination.requested.connect(self._paginate)
+        status_bar.addWidget(self.pagination)
+        listing.addLayout(status_bar)
+        self.results = QStackedWidget()
+        self.list = ContentList(self.images)
+        self.list.setAccessibleName("Discovered and installed content")
+        self.list.item_opened.connect(self.open_details)
+        self.list.action_requested.connect(self._row_action)
+        self.list.verticalScrollBar().valueChanged.connect(self._remember_scroll)
+        self.results.addWidget(self.list)
+        self.skeleton = SkeletonList()
+        self.results.addWidget(self.skeleton)
+        self.empty = GlassPanel(radius=theme.RADIUS_CARD)
+        empty = QVBoxLayout(self.empty)
+        empty.setContentsMargins(32, 32, 32, 32)
+        empty.addStretch()
+        self.empty_title = text_label("Choose an instance", theme.FONT_DIALOG_TITLE, bold=True)
+        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_note = text_label("", theme.FONT_BODY, muted=True)
+        self.empty_note.setWordWrap(True)
+        self.empty_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_note.setMaximumWidth(620)
+        empty.addWidget(self.empty_title, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty.addWidget(self.empty_note, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.empty_retry = GlassButton("Refresh profiles")
+        self.empty_retry.setFixedHeight(theme.BUTTON_HEIGHT)
+        self.empty_retry.clicked.connect(self.refresh)
+        empty.addWidget(self.empty_retry, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty.addStretch()
+        self.results.addWidget(self.empty)
+        listing.addWidget(self.results, 1)
+        self.body.addWidget(self.listing)
+        self.notice_host = QWidget()
+        self.notice_host.setFixedHeight(theme.SEGMENT_HEIGHT)
+        notice = QHBoxLayout(self.notice_host)
+        notice.setContentsMargins(0, 0, 0, 0)
+        self.notice = ElidedLabel()
+        self.notice.setProperty("muted", True)
+        self.notice.setMinimumHeight(22)
+        notice.addWidget(self.notice, 1)
+        self.undo = GlassButton("Undo")
+        self.undo.setFixedHeight(theme.COMPACT_HEIGHT)
+        self.undo.setVisible(False)
+        self.undo.clicked.connect(self._undo_remove)
+        notice.addWidget(self.undo)
+        layout.addWidget(self.notice_host)
+        self.notice_host.setVisible(False)
+        self._render()
+
+    def apply_theme(self, colors: dict[str, str]) -> None:
+        self._colors = colors
+        self.list.set_accent(colors["btn_primary"], colors["btn_primary_text"])
+        if self._details is not None:
+            self._details.apply_theme(colors)
+
+    def _save_view_state(self) -> None:
+        if self.view == "browse":
+            self.browse_state.scroll = self.list.verticalScrollBar().value()
+        else:
+            self._installed_scrolls[self.kind] = self.list.verticalScrollBar().value()
+
+    def _remember_scroll(self, value: int) -> None:
+        if not self._updating_list and self.body.currentWidget() is self.listing:
+            if self.view == "browse":
+                self.browse_state.scroll = value
+            else:
+                self._installed_scrolls[self.kind] = value
+
+    def _restore_fields(self) -> None:
+        browse = self.view == "browse"
+        state = self.browse_state
+        self.search.blockSignals(True)
+        self.search.setText(state.query if browse else self._installed_queries.get(self.kind, ""))
+        self.search.blockSignals(False)
+        self.sort.blockSignals(True)
+        self.sort.setCurrentIndex(max(0, self.sort.findData(state.sort)))
+        self.sort.blockSignals(False)
+
+    def _kind_changed(self) -> None:
+        kind = self.content_selector.currentData()
+        if kind == self.kind or self._busy or self._review:
             return
-        self._saved_scroll = self.list_view._scroll_pixels
-        self._selection_open = True
-        self.list_reveal.finish(update=False)
-        self._render_profile_selection()
-        self.listing.visible = False
-        self.selection_host.visible = True
-        self._update()
-        self.selection_reveal.show(self.selection_host.content, self.reveal_controls)
+        self._save_view_state()
+        self._invalidate_reads()
+        self.close_details()
+        self.kind = kind
+        self.view = self._modes[kind]
+        self._load_error = ""
+        self._restore_fields()
+        self._load_context(self.profile)
 
-    def close_profile_selection(self) -> None:
-        was_open = self._selection_open
-        self._selection_open = False
-        self.selection_reveal.finish(update=False)
-        self.selection_host.visible = False
-        self.listing.visible = not self._details_open
-        self._update()
-        if was_open and self._active and self._saved_scroll:
-            self._page.run_task(self._restore_scroll, self._generation, self._saved_scroll)
-
-    def select_profile(self, profile_id: str) -> None:
-        if self._operation_in_progress or not self._selection_open:
+    def _provider_changed(self) -> None:
+        provider = self.provider_selector.currentData()
+        if provider == self.provider:
             return
-        target = next((item for item in self._get_profiles() if item["id"] == profile_id), None)
-        if target is None:
-            self._render_profile_selection()
-            self._show_notification("This profile is no longer available.", "warning")
-            self._update()
-            return
-        if profile_id != (self.profile or {}).get("id"):
-            self._saved_scroll = 0
-        self.close_profile_selection()
-        if target == self.profile:
-            return
-        self._set_profile(target)
-
-    def _set_profile(self, profile: dict | None, *, defer_load: bool = False) -> None:
-        self._generation += 1
-        previous_profile = self.profile or {}
-        previous_manager = self.manager
-        changed = any(previous_profile.get(key) != (profile or {}).get(key)
-                      for key in ("id", "loader", "loader_version", "minecraft_version", "version_id", "is_instance"))
-        self.profile = profile.copy() if profile else None
-        self._render_profile_header()
-        self.error = ""
-        self.manager = None
-        if profile and profile.get("is_instance"):
-            try:
-                directory = self._game_directory(profile)
-                if profile.get("is_instance") and not directory.is_dir():
-                    raise ValueError("This instance folder is missing. Restore it or edit the profile's game folder.")
-                self.manager = self._managers.get(directory)
-                if self.manager is None:
-                    self.manager = self._managers[directory] = ModManager(directory, runtime_directory=self._runtime_directory)
-            except (OSError, ValueError) as error:
-                self.error = str(error)
-        if changed or previous_manager is not self.manager:
-            self._updates.clear()
-            self._update_summary = ""
-            self.close_details()
-            self._row_cache.clear()
-            self._saved_scroll = 0
-            self.local_mods = []
-            self.hits = []
-            self.search_offset = 0
-            self.total_hits = 0
-        if self._compatible():
-            context = (self.manager.game_directory, self.profile["minecraft_version"], self.profile["loader"].lower(),
-                       self.profile.get("loader_version", ""), self.profile.get("version_id", ""))
-            release_type = self._update_filters.get(context)
-            if release_type is None:
-                release_type = self.manager.saved_update_release_type(*context[1:]) or self.details_page.release_filter.value
-            self._update_filters[context] = release_type
-            self.details_page.release_filter.refresh_options(self.details_page.release_filter.options, release_type)
-        self.refresh(defer_load=defer_load)
-
-    def _compatible(self) -> bool:
-        return bool(self.profile and self.profile.get("is_instance") and self.manager
-                    and str(self.profile.get("loader", "")).lower() in SUPPORTED_LOADERS
-                    and self.profile.get("minecraft_version"))
+        self._save_view_state()
+        self._search_task.invalidate()
+        self._debounce.stop()
+        self.provider = provider
+        self._load_error = ""
+        self._restore_fields()
+        self._load_browse()
 
     def set_view(self, view: str) -> None:
-        if view not in self.queries or view == self.view or self._operation_in_progress:
+        if view == self.view or view not in {"browse", "installed"} or self._busy or self._review:
             return
-        self.queries[self.view] = self.search.value or ""
-        self.view = view
-        self.search.value = self.queries[view]
-        self.search_offset = 0
-        self._saved_scroll = 0
-        self.list_view._scroll_pixels = 0
-        self.refresh(animate_list=True)
-        self._page.run_task(self._restore_scroll, self._generation, 0)
-
-    def refresh(self, *, defer_load: bool = False, animate_list: bool = False) -> None:
-        if self.content_type in {"shader", "resourcepack"}:
-            self.content_packs_page.refresh(defer_load=defer_load)
-            return
-        if self.content_type == "modpacks":
-            self.modpacks_page.refresh(defer_load=defer_load)
-            return
-        self._finish_update_activity()
-        self._generation += 1
-        self._pending_load = None
-        self._finish_load_activity()
-        self.error = "" if self.manager else self.error
-        self.loading = bool(self.manager and self._compatible())
+        self._save_view_state()
+        self._search_task.invalidate()
+        self._debounce.stop()
+        self.view = self._modes[self.kind] = view
+        self._loading = False
+        self._load_error = ""
+        self._restore_fields()
         self._render()
-        if animate_list:
-            self.list_reveal.show(self.list_body, [self.list_body])
-        self._update()
-        if self.loading:
-            self._pending_load = (self._generation, self.profile.copy(), self.manager,
-                                  self.view, self.search.value or "", self.sort.value, self.search_offset)
-            if not defer_load:
-                self.start_loading()
+        if view == "browse":
+            self._load_browse()
+        elif self.kind == "mods":
+            self._identify_installed()
 
-    def _refresh_requested(self, e) -> None:
-        if self._operation_in_progress:
+    def _query_changed(self, query: str) -> None:
+        if self.view == "installed":
+            self._installed_queries[self.kind] = query
+            self._installed_scrolls[self.kind] = 0
+            self._filter_installed()
+        else:
+            state = self.browse_state
+            state.query, state.offset, state.scroll = query, 0, 0
+            self._search_task.invalidate()
+            self._loading = False
+            self._debounce.start()
+
+    def _submit_search(self) -> None:
+        if self.view == "browse":
+            self._debounce.stop()
+            self._load_browse()
+
+    def _sort_changed(self) -> None:
+        state = self.browse_state
+        state.sort, state.offset, state.scroll = self.sort.currentData(), 0, 0
+        if self.view == "browse":
+            self._load_browse()
+
+    def _paginate(self, direction: int) -> None:
+        if self._loading or self._busy:
             return
-        clear = getattr(self.client, "clear_cache", None)
-        if callable(clear):
-            clear()
-        if self._compatible():
-            self.manager.clear_update_check(self.profile["minecraft_version"], self.profile["loader"].lower(),
-                                            loader_version=self.profile.get("loader_version", ""),
-                                            release_type=self.details_page.release_filter.value)
+        state = self.browse_state
+        state.offset = max(0, state.offset + direction * self.PAGE_SIZE)
+        state.scroll = 0
+        self._load_browse()
+
+    def _filter_installed(self, *args) -> None:
+        if self.view == "installed":
+            self.list.set_filter(self.search.text(), self.state_filter.currentData() if self.kind == "mods" else "all")
+            self.list.verticalScrollBar().setValue(0)
+            self._render_feedback()
+
+    def enter(self, profile_id: str | None = None) -> None:
+        """Library shortcuts request only their actual saved profile."""
+        if self._busy or self._review:
+            return
+        if profile_id is not None:
+            self._desired_id, self._explicit_profile = profile_id, True
+            if self.kind != "mods":
+                self._save_view_state()
+                self._invalidate_reads()
+                self.kind = "mods"
+                self.view = self._modes["mods"]
+                self.content_selector.blockSignals(True)
+                self.content_selector.setCurrentIndex(self.content_selector.findData("mods"))
+                self.content_selector.blockSignals(False)
+                self._restore_fields()
+            self.close_details()
+        if self._active:
+            self._reload_profiles()
+
+    def _reload_profiles(self, *, fresh: bool = False) -> None:
+        if not self._active or self._busy or self._review:
+            return
+        self._loading_profiles = True
+        self._render()
+
+        def operation():
+            if fresh:
+                self.client.clear_cache()
+            return [dict(profile) for profile in self._get_profiles()]
+
+        def ready(profiles: list[dict]) -> None:
+            self._loading_profiles = False
+            self._profiles = profiles
+            desired = self._desired_id or (self.profile or {}).get("id") or self._selected_profile()
+            target = next((profile for profile in profiles if profile.get("id") == desired), None)
+            if target is None and not self._explicit_profile:
+                target = next((profile for profile in profiles if profile.get("is_instance")
+                               and profile.get("loader", "").lower() in SUPPORTED_LOADERS), profiles[0] if profiles else None)
+            if target is None and self._explicit_profile:
+                self._notify("This preview profile has no saved instance. Choose an existing profile here.")
+            self._desired_id = None
+            self._explicit_profile = False
+            self.profile_selector.blockSignals(True)
+            self.profile_selector.clear()
+            for profile in profiles:
+                self.profile_selector.addItem(f"{profile.get('name', 'Profile')} · {profile.get('minecraft_version', '')} / {profile.get('loader', '')}", profile["id"])
+            self.profile_selector.setCurrentIndex(self.profile_selector.findData(target["id"]) if target else -1)
+            self.profile_selector.blockSignals(False)
+            self._loaded_profiles = True
+            self._load_context(target, fresh=fresh)
+
+        def failed(error: Exception) -> None:
+            self._loading_profiles = False
+            self._profile_error = str(error)
+            self._render()
+
+        self._profile_task.submit(operation, ready, failed)
+
+    def _profile_selected(self) -> None:
+        if self._busy or self._review:
+            return
+        target = next((profile for profile in self._profiles if profile["id"] == self.profile_selector.currentData()), None)
+        self._load_context(target)
+
+    def _load_context(self, profile: dict | None, *, fresh: bool = False) -> None:
+        changed = _profile_key(profile) != _profile_key(self.profile)
+        self._search_task.invalidate()
+        self._scan_task.invalidate()
+        self._identity_task.invalidate()
+        self._check_task.invalidate()
+        self._details_task.invalidate()
+        self._changelog_task.invalidate()
+        self._checking = False
+        self._load_error = self._profile_error = ""
+        self._loading = False
+        if changed:
+            self.close_details()
+            self.local_mods = []
+            self.local_packs = []
+            self._updates.clear()
+            self._update_summary = ""
+            for state in self._browse.values():
+                state.hits, state.offset, state.total, state.scroll, state.loaded_key = [], 0, 0, 0, None
+        self.profile = dict(profile) if profile else None
+        self.manager = self.content_manager = None
+        self._scanning = bool(profile)
+        kind = self.kind
+        self._render()
+        if not self._active:
+            self._scanning = False
+            return
+
+        def operation():
+            if not profile:
+                return None, None
+            if kind == "mods" and not profile.get("is_instance"):
+                return None, None
+            directory = Path(self._game_directory(profile)).resolve()
+            if not directory.is_dir():
+                raise ValueError("This profile's game folder is missing. Restore it or edit the profile in the launcher.")
+            manager, content_manager = None, None
+            if kind == "mods" and profile.get("is_instance"):
+                if directory not in self._managers:
+                    self._managers[directory] = ModManager(directory, runtime_directory=self._runtime_directory or _runtime_directory())
+                    if len(self._managers) > 8:
+                        self._managers.popitem(last=False)
+                manager = self._managers[directory]
+                self._managers.move_to_end(directory)
+                if fresh:
+                    manager.clear_update_check(profile["minecraft_version"], profile["loader"].lower(),
+                                               loader_version=profile.get("loader_version", ""), release_type=self._release)
+            elif kind in {"shader", "resourcepack"}:
+                key = (directory, kind)
+                if key not in self._content_managers:
+                    self._content_managers[key] = ContentPackManager(directory, kind)
+                    if len(self._content_managers) > 8:
+                        self._content_managers.popitem(last=False)
+                content_manager = self._content_managers[key]
+                self._content_managers.move_to_end(key)
+            return manager, content_manager
+
+        def ready(context) -> None:
+            self._scanning = False
+            self.manager, self.content_manager = context
+            self._scan_installed()
+            self._load_browse()
+            if self._detail_item is not None and not self._detail_loaded:
+                self._load_details()
+
+        def failed(error: Exception) -> None:
+            self._scanning = False
+            self._profile_error = str(error)
+            self._render()
+
+        self._context_task.submit(operation, ready, failed)
+
+    def _compatible(self) -> bool:
+        return bool(self.manager and self.profile and self.profile.get("is_instance")
+                    and self.profile.get("loader", "").lower() in SUPPORTED_LOADERS and self.profile.get("minecraft_version"))
+
+    def _can_browse(self) -> bool:
+        if self.kind == "modpacks":
+            return True
+        if self.kind == "mods":
+            return self._compatible()
+        return bool(self.content_manager and self.profile)
+
+    def _scan_installed(self) -> None:
+        if self.kind == "modpacks":
+            self._render()
+            return
+        if (self.kind == "mods" and not self._compatible()) or (self.kind != "mods" and not self.content_manager):
+            self._render()
+            return
+        self._scanning = True
+        manager, profile, kind, release = self.manager or self.content_manager, dict(self.profile), self.kind, self._release
+        chosen_release = self._release_choices.get(_profile_key(profile))
+        self._render()
+
+        def operation():
+            if kind != "mods":
+                return manager.scan(), None, release
+            mods = manager.list_mods()
+            selected = chosen_release or manager.saved_update_release_type(profile["minecraft_version"], profile["loader"].lower(),
+                                                                           profile.get("loader_version", ""), profile.get("version_id", "")) or "release"
+            check = manager.cached_update_check(profile["minecraft_version"], profile["loader"].lower(),
+                                                 loader_version=profile.get("loader_version", ""), release_type=selected,
+                                                 version_id=profile.get("version_id", ""))
+            return mods, check, selected
+
+        def ready(result) -> None:
+            self._scanning = False
+            items, check, selected = result
+            if kind == "mods":
+                self.local_mods = list(check.mods) if check else items
+                self._set_release(selected)
+                self._apply_update_check(check, saved=True)
+                if self.view == "installed":
+                    self._identify_installed()
+            else:
+                self.local_packs = items
+            self._render()
+            self._sync_details()
+
+        def failed(error: Exception) -> None:
+            self._scanning = False
+            self._load_error = str(error)
+            self._render()
+
+        self._scan_task.submit(operation, ready, failed)
+
+    def _identify_installed(self) -> None:
+        if not self._compatible() or self._scanning or self._busy:
+            return
+        manager = self.manager
+
+        def ready(result) -> None:
+            self.local_mods, warnings = result
+            if warnings:
+                self._notify("\n".join(warnings[:3]))
+            self._render()
+            self._sync_details()
+
+        self._identity_task.submit(lambda: manager.identify_mods(self.client), ready,
+                                   lambda error: self._notify(str(error)))
+
+    def _search_key(self) -> tuple:
+        state = self.browse_state
+        context = () if self.kind == "modpacks" else _profile_key(self.profile)
+        return self.kind, self.provider, context, state.query.strip(), state.sort, state.offset
+
+    def _load_browse(self) -> None:
+        self._debounce.stop()
+        if not self._active or self.view != "browse" or self._busy or not self._can_browse():
+            self._render()
+            return
+        state = self.browse_state
+        key = self._search_key()
+        if state.loaded_key == key:
+            self._loading = False
+            self._render()
+            return
+        self._loading = True
+        self._load_error = ""
+        state.hits, state.total = [], 0
+        profile, kind, provider = dict(self.profile or {}), self.kind, self.provider
+        query, sort, offset = state.query.strip(), state.sort, state.offset
+        self._render()
+
+        def operation():
+            args = {"provider": provider, "index": sort, "offset": offset, "limit": self.PAGE_SIZE}
+            if kind == "modpacks":
+                return self.client.search_modpacks(query, **args)
+            if kind != "mods":
+                return self.client.search_content(query, profile["minecraft_version"], kind, **args)
+            return self.client.search(query, profile["minecraft_version"], profile["loader"].lower(), **args)
+
+        def ready(data: dict) -> None:
+            if key != self._search_key() or self.view != "browse":
+                return
+            self._loading = False
+            state.hits, state.total, state.loaded_key = data["hits"], int(data.get("total_hits", len(data["hits"]))), key
+            self._render()
+
+        def failed(error: Exception) -> None:
+            self._loading = False
+            self._load_error = str(error)
+            self._render()
+
+        self._search_task.submit(operation, ready, failed)
+
+    def refresh(self) -> None:
+        if self._busy or self._review:
+            return
+        self._invalidate_reads()
+        self.browse_state.loaded_key = None
         self._updates.clear()
         self._update_summary = ""
-        self.refresh()
+        self._detail_loaded = False
+        self._reload_profiles(fresh=True)
 
-    def start_loading(self) -> None:
-        """Start a prepared scan after the sidebar entrance has been mounted."""
-        if self.content_type in {"shader", "resourcepack"}:
-            self.content_packs_page.start_loading()
+    def _invalidate_reads(self) -> None:
+        self._debounce.stop()
+        for task in self._read_tasks:
+            task.invalidate()
+        self._loading = self._scanning = self._loading_profiles = self._checking = False
+
+    def _installed_profiles(self) -> list[dict]:
+        return [profile for profile in self._profiles if isinstance(profile.get("modpack"), dict)]
+
+    def _installed_items(self) -> list[ContentItem]:
+        if self.kind == "mods":
+            return [ContentItem(
+                mod.filename, mod.name, mod.description,
+                " · ".join(filter(None, (mod.version, format_size(mod.size), "Pack managed" if mod.pack_owned else ""))),
+                mod.icon, (ContentAction("toggle", "Disable mod" if mod.enabled else "Enable mod", switch=True),
+                           ContentAction("update", "Update", mod.filename in self._updates, True),
+                           ContentAction("remove", "Remove", primary=True)) if mod.filename in self._updates else
+                          (ContentAction("toggle", "Disable mod" if mod.enabled else "Enable mod", switch=True), ContentAction("remove", "Remove", primary=True)),
+                checked=mod.enabled, payload=mod, search_text=mod.filename,
+            ) for mod in self.local_mods]
+        if self.kind == "modpacks":
+            return [ContentItem(
+                profile["id"], profile.get("name", "Modpack"),
+                f"{profile['modpack'].get('name', '')} · Pack {profile['modpack'].get('version', 'Imported')}",
+                f"{profile.get('minecraft_version', '')} / {profile.get('loader', '')} {profile.get('loader_version', '')}",
+                profile.get("icon"), (ContentAction("mods", "Mods"), ContentAction("folder", "Folder")), payload=profile,
+            ) for profile in self._installed_profiles()]
+        return [ContentItem(pack.filename, pack.title, pack.filename,
+                            " · ".join(filter(None, (pack.version, format_size(pack.size)))),
+                            actions=(ContentAction("remove", "Remove", primary=True),), payload=pack) for pack in self.local_packs]
+
+    def _browse_items(self) -> list[ContentItem]:
+        if self.kind == "mods":
+            installed = {mod.project_id for mod in self.local_mods if mod.project_id}
+        elif self.kind == "modpacks":
+            installed = {profile["modpack"].get("project_id") for profile in self._installed_profiles()}
+        else:
+            installed = {pack.project_id for pack in self.local_packs if pack.project_id}
+        return [ContentItem(
+            str(hit.get("project_id") or hit.get("id")), hit.get("title") or hit.get("name", "Project"), hit.get("description", ""),
+            " · ".join(filter(None, (hit.get("author", ""), f"{format_downloads(int(hit.get('downloads', 0)))} downloads"))),
+            hit.get("icon_url"), (ContentAction("install", "Installed" if hit.get("project_id") in installed else "Install",
+                                               hit.get("project_id") not in installed, True),), payload=hit,
+        ) for hit in self.browse_state.hits]
+
+    def _empty_state(self) -> tuple[str, str]:
+        if self._loading_profiles or self._scanning:
+            return "Loading profiles…" if self._loading_profiles else "Reading installed content…", "Your launcher stays responsive while this loads."
+        if self._profile_error:
+            return "Instance unavailable", self._profile_error
+        if self.kind != "modpacks" and not self.profile:
+            return "Choose a profile", "Select an existing profile above. Create and install profiles in the existing launcher, then refresh here."
+        if self.kind == "mods" and self.profile and not self.profile.get("is_instance"):
+            return "Use a separate instance", "This profile uses the global Minecraft folder. Create a separate instance in the launcher to keep its mods isolated from other profiles."
+        if self.kind == "mods" and not self._compatible():
+            return "This profile needs a mod loader", "Choose an instance with Fabric, Quilt, Forge, or NeoForge and a Minecraft version."
+        if self._load_error:
+            return "Could not load content", redact_credentials(self._load_error)
+        if self._loading:
+            return "Searching…", "Finding compatible content on " + ("CurseForge" if self.provider == "curseforge" else "Modrinth") + "."
+        if self.view == "browse":
+            return "No compatible results", "Try a different search or provider."
+        return "No installed content", "Add local JARs or browse compatible projects." if self.kind == "mods" else "Install a pack from Discover to get started."
+
+    def _render(self) -> None:
+        if not hasattr(self, "list"):
             return
-        if self.content_type == "modpacks":
-            self.modpacks_page.start_loading()
+        browse, mods, packs = self.view == "browse", self.kind == "mods", self.kind == "modpacks"
+        self.heading.setText(dict(CONTENT_OPTIONS)[self.kind])
+        self.profile_selector.setVisible(not packs)
+        locked = self._busy or self._review is not None
+        for field in (self.content_selector, self.profile_selector, self.search, self.provider_selector, self.sort,
+                      self.state_filter, self.release_filter, self.discover, self.installed, self.add, self.key_button, self.refresh_button):
+            field.setEnabled(not locked)
+        self.discover.setChecked(browse)
+        self.installed.setChecked(not browse)
+        count = len(self.local_mods) if mods else len(self._installed_profiles()) if packs else len(self.local_packs)
+        self.installed.setText(f"Installed ({count})")
+        self.attribution.setVisible(browse)
+        self.attribution.setText("Powered by " + ("CurseForge" if self.provider == "curseforge" else "Modrinth"))
+        self.provider_selector.setVisible(browse)
+        self.sort.setVisible(browse)
+        self.state_filter.setVisible(not browse and mods)
+        self.release_filter.setVisible(not browse and mods)
+        self.key_button.setVisible(browse and self.provider == "curseforge")
+        self.add.setVisible(packs or (mods and not browse))
+        self.add.setText("Import pack" if packs else "Add JARs")
+        self.add.setEnabled(not locked and not self._is_running() and (packs or self._compatible()))
+        self.updates.setVisible(mods and not browse)
+        self.updates.setText("Checking…" if self._checking else "Update all" if self._updates else "Check updates")
+        self.updates.setEnabled(not locked and not self._scanning and not self._checking and self._compatible())
+        self.search.setPlaceholderText("Search " + ("installed " if not browse else "") + dict(CONTENT_OPTIONS)[self.kind].lower())
+        self.list.actions_enabled = not locked and not self._is_running()
+        if self._details is not None:
+            self._details.set_can_change(not locked and not self._is_running() and (packs or self._can_browse()))
+        rows = self._browse_items() if browse else self._installed_items()
+        offset = self.browse_state.scroll if browse else self._installed_scrolls.get(self.kind, 0)
+        if self.body.currentWidget() is self.listing:
+            self._updating_list = True
+            self.list.set_items(rows)
+            self.list.set_filter("" if browse else self.search.text(), self.state_filter.currentData() if not browse and mods else "all")
+            self.list.verticalScrollBar().setValue(offset)
+            self._updating_list = False
+        usable = packs or self._can_browse()
+        loading = self._loading or self._scanning or self._loading_profiles
+        if rows and usable:
+            self.results.setCurrentWidget(self.list)
+        elif loading and usable:
+            self.results.setCurrentWidget(self.skeleton)
+        else:
+            self.results.setCurrentWidget(self.empty)
+        title, note = self._empty_state()
+        self.empty_title.setText(title)
+        self.empty_note.setText(note)
+        self.empty_retry.setVisible(not self._loading and not self._loading_profiles and not self._scanning)
+        self.empty_retry.setEnabled(not locked)
+        self.pagination.display(self.browse_state.offset, self.browse_state.total if browse else 0,
+                                busy=self._loading or locked)
+        self.loading_changed.emit(self._active and (self._loading or self._scanning or self._loading_profiles or self._checking))
+        self.undo.setEnabled(not locked and not self._is_running())
+        self._render_feedback()
+
+    def _render_feedback(self) -> None:
+        if self._loading:
+            message = "Searching…"
+        elif self._scanning or self._loading_profiles:
+            message = "Reading installed content…"
+        elif self.view == "browse":
+            message = f"{self.browse_state.total:,} compatible results" if self.kind != "modpacks" else f"{self.browse_state.total:,} modpacks"
+        elif self.kind == "mods":
+            enabled = sum(mod.enabled for mod in self.local_mods)
+            message = f"{enabled} enabled · {len(self.local_mods) - enabled} disabled"
+            if self._update_summary:
+                message += " · " + self._update_summary
+        else:
+            message = f"{self.list.proxy.rowCount()} installed"
+        if self.kind == "shader":
+            message += " · Enable in Minecraft with Iris or OptiFine"
+        elif self.kind == "resourcepack":
+            message += " · Enable in Minecraft's Resource Packs settings"
+        self.status.setText(message)
+
+    def _notify(self, message: str, *, undo: tuple[ModManager, str, str] | None = None) -> None:
+        self._notice_timer.stop()
+        self.notice.setText(redact_credentials(message))
+        self.notice_host.setVisible(bool(message))
+        if undo is not None or not message:
+            self._undo = undo
+        self.undo.setVisible(self._undo is not None)
+        if message:
+            self._notice_timer.start(15000 if self._undo else 8000)
+
+    def _open_link(self, url: str) -> None:
+        target = QUrl(url)
+        if target.scheme() in {"http", "https"} and not QDesktopServices.openUrl(target):
+            self._notify("Could not open the link in your browser.")
+
+    def open_details(self, item: ContentItem) -> None:
+        if self._busy or self._review:
             return
-        request, self._pending_load = self._pending_load, None
-        if request is None:
-            return
-        activity = track_progress(self._progress if self._active else None,
-                                  "Fetching compatible mods..." if request[3] == "browse" else "Reading installed mods...", priority=40)
-        self._load_activity = activity
-        self._page.run_task(self._load, *request, activity)
-
-    def _finish_load_activity(self) -> None:
-        if self._load_activity:
-            self._load_activity.finish()
-            self._load_activity = None
-
-    def _finish_update_activity(self) -> None:
-        if self._update_activity:
-            self._update_activity.finish()
-            self._update_activity = None
-        self.checking_updates = False
-
-    def _update_release_filter(self, e) -> None:
-        self._finish_update_activity()
-        self._updates.clear()
-        self._update_summary = ""
+        self._save_view_state()
+        self._search_task.invalidate()
+        self._loading = False
+        self._detail_item, self._detail_loaded = item, False
+        self.details.open(item, self.kind, self.profile)
+        self.details.set_release(self._release)
+        self.body.setCurrentWidget(self.details)
         self._render()
-        self._update()
+        self._load_details()
+
+    def close_details(self) -> None:
+        if not hasattr(self, "body"):
+            return
+        self._details_task.invalidate()
+        self._changelog_task.invalidate()
+        self._detail_item = None
+        self._detail_loaded = False
+        self.body.setCurrentWidget(self.listing)
+        self._render()
+
+    def _details_payload(self, item: ContentItem, profile: dict, kind: str, manager: ModManager | None,
+                         release: str) -> dict:
+        payload = item.payload
+        local_info, local, warning = {}, None, ""
+        project = {"title": item.title, "description": item.description}
+        if isinstance(payload, LocalMod):
+            local = payload
+            local_info = manager.describe_mod(payload.filename)
+            project_id = payload.project_id
+            if not project_id:
+                try:
+                    matched = manager.identify_local(payload.filename, self.client)
+                    if matched:
+                        project_id = matched.get("project_id", "")
+                        local = replace(payload, project_id=project_id, version_id=matched.get("id", ""))
+                except Exception as error:
+                    warning = str(error)
+        elif isinstance(payload, LocalContentPack):
+            local = payload
+            project_id = payload.project_id
+        elif kind == "modpacks" and payload.get("modpack"):
+            local = payload
+            project_id = payload["modpack"].get("project_id", "")
+        else:
+            project_id = payload.get("project_id") or payload.get("id", "")
+        result = {"project": project, "local_info": local_info, "local": local, "versions": [], "members": [], "warning": warning}
+        if not project_id:
+            return result
+        project["project_id"] = project_id
+        if kind == "modpacks":
+            operations = (lambda: self.client.modpack_project(project_id), lambda: self.client.modpack_versions(project_id))
+        elif kind in {"shader", "resourcepack"}:
+            operations = (lambda: self.client.content_project(project_id, kind),
+                          lambda: self.client.content_versions(project_id, profile["minecraft_version"], kind))
+        else:
+            operations = (lambda: self.client.project(project_id), lambda: self.client.project_versions(project_id),
+                          lambda: self.client.project_members(project_id))
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="Wisc details") as executor:
+            futures = [executor.submit(operation) for operation in operations]
+            for name, future in zip(("project", "versions", "members"), futures):
+                try:
+                    value = future.result()
+                    result[name] = {**project, **value} if name == "project" else value
+                except Exception as error:
+                    result["warning"] = str(error)
+        if kind == "mods" and local and not local.pack_owned:
+            versions = result["versions"]
+            current = next((version for version in versions if version.get("id") == local.version_id), None)
+            if current:
+                try:
+                    loader = profile["loader"].lower()
+                    providers = ()
+                    if loader == "fabric" and profile.get("loader_version"):
+                        providers, _ = manager.profile_providers(profile["minecraft_version"], loader,
+                                                                 profile["loader_version"], profile.get("version_id", ""), runtime_only=True)
+
+                    def check_loader(version: dict) -> bool:
+                        compatible = version_matches_environment(self.client, version, loader,
+                                                                 profile.get("loader_version", ""), providers)
+                        version["_profile_compatible"] = compatible
+                        return compatible
+
+                    result["update"] = newer_compatible_version(
+                        current, versions, profile["minecraft_version"], loader, release_type=release,
+                        loader_version=profile.get("loader_version", ""), check_loader=check_loader if loader == "fabric" else None,
+                    )
+                except Exception as error:
+                    result["warning"] = str(error)
+        return result
+
+    def _load_details(self, *, fresh: bool = False) -> None:
+        if not self._active or self._detail_item is None or self._busy:
+            return
+        item, profile, kind, manager, release = self._detail_item, dict(self.profile or {}), self.kind, self.manager, self._release
+        self._detail_loaded = False
+        self.details.set_feedback("Loading details…")
+
+        def operation():
+            if fresh:
+                self.client.clear_cache()
+            return self._details_payload(item, profile, kind, manager, release)
+
+        def ready(data: dict) -> None:
+            self._detail_loaded = True
+            local = data.get("local")
+            if isinstance(local, LocalMod) and local.project_id:
+                self.local_mods = [local if mod.filename == local.filename else mod for mod in self.local_mods]
+            self.details.display(data)
+            self._render()
+
+        def failed(error: Exception) -> None:
+            self.details.set_feedback(redact_credentials(str(error)))
+
+        self._details_task.submit(operation, ready, failed)
+
+    def _load_changelog(self, version: dict) -> None:
+        self._changelog_task.invalidate()
+        if not str(version.get("id", "")).startswith("cf:") or version.get("_changelog_loaded"):
+            return
+        self.details.changelog_body.display("Loading changelog…")
+
+        def operation():
+            result = self.client.version(version["id"])
+            if result.get("id") != version["id"] or result.get("project_id") != version.get("project_id"):
+                raise ValueError("The provider returned a different version's changelog.")
+            if result.get("_changelog_unavailable"):
+                raise ConnectionError("The changelog is unavailable. Reopen this version to retry.")
+            return result.get("changelog", "")
+
+        def ready(body: str) -> None:
+            version["changelog"] = body
+            version["_changelog_loaded"] = True
+            if self.details._selected_version is version:
+                self.details.changelog_body.display(body or "No changelog supplied.", "https://www.curseforge.com/")
+
+        self._changelog_task.submit(operation, ready, lambda error:
+                                   self.details.changelog_body.display(redact_credentials(str(error))))
+
+    def _sync_details(self) -> None:
+        if self._detail_item is None:
+            return
+        original = self._detail_item.payload
+        project_id = self.details.project.get("project_id")
+        if self.kind == "mods":
+            local = next((mod for mod in self.local_mods if
+                          jar_base_name(mod.filename) == jar_base_name(getattr(original, "filename", ""))
+                          or (project_id and mod.project_id == project_id)), None)
+        elif self.kind in {"shader", "resourcepack"}:
+            local = next((pack for pack in self.local_packs if pack.filename == getattr(original, "filename", "")
+                          or (project_id and pack.project_id == project_id)), None)
+        else:
+            return
+        self.details.sync_local(local)
+
+    def _set_release(self, release: str) -> None:
+        self._release = release
+        self._release_choices[_profile_key(self.profile)] = release
+        self.release_filter.blockSignals(True)
+        self.release_filter.setCurrentIndex(max(0, self.release_filter.findData(release)))
+        self.release_filter.blockSignals(False)
+        if self._details is not None:
+            self._details.set_release(release)
+
+    def _release_changed(self, release: str) -> None:
+        if release == self._release or release not in dict(RELEASE_OPTIONS):
+            return
+        self._check_task.invalidate()
+        self._checking = False
+        self._set_release(release)
+        self._apply_update_check(None)
+        self._render()
+        if self._detail_item is not None:
+            self._load_details()
         if self._compatible():
-            context = (self.manager.game_directory, self.profile["minecraft_version"], self.profile["loader"].lower(),
-                       self.profile.get("loader_version", ""), self.profile.get("version_id", ""))
-            self._update_filters[context] = self.details_page.release_filter.value
-            self._page.run_task(self._restore_update_cache, self._generation, self.profile.copy(), self.manager,
-                                self.details_page.release_filter.value)
+            manager, profile = self.manager, dict(self.profile)
+            self._check_task.submit(
+                lambda: manager.cached_update_check(profile["minecraft_version"], profile["loader"].lower(),
+                                                     loader_version=profile.get("loader_version", ""), release_type=release,
+                                                     version_id=profile.get("version_id", "")),
+                lambda result: self._restore_check(result), lambda error: self._notify(str(error)),
+            )
+
+    def _restore_check(self, result: UpdateCheck | None) -> None:
+        self._apply_update_check(result, saved=True)
+        self._render()
 
     def _apply_update_check(self, result: UpdateCheck | None, *, saved: bool = False) -> None:
         self._updates = {update.mod.filename: update for update in result.updates} if result else {}
         self._update_summary = ""
         if result is not None:
-            count = len(result.updates)
-            self._update_summary = f"{count} {'update' if count == 1 else 'updates'} available" if count else "No updates found"
+            self._update_summary = f"{len(result.updates)} updates available" if result.updates else "No updates found"
             if result.warnings:
                 self._update_summary += " · Some mods could not be checked"
             if saved:
                 self._update_summary += " · Saved check"
 
-    async def _restore_update_cache(self, generation: int, profile: dict, manager: ModManager, release_type: str) -> None:
-        result = await asyncio.to_thread(manager.cached_update_check, profile["minecraft_version"], profile["loader"].lower(),
-                                         loader_version=profile.get("loader_version", ""), release_type=release_type,
-                                         version_id=profile.get("version_id", ""))
-        if (generation == self._generation and manager is self.manager and self._active
-                and release_type == self.details_page.release_filter.value and not self.checking_updates):
-            self._apply_update_check(result, saved=True)
-            self._render()
-            self._update()
-
-    async def _updates_action(self, e) -> None:
+    def _updates_action(self) -> None:
         if self._updates:
             updates = tuple(self._updates.values())
-            await self._prepare_install({"project_id": updates[0].version["project_id"], "title": f"{len(updates)} mods"},
-                                        updates=updates)
-        else:
-            await self._check_updates(e)
-
-    async def _check_updates(self, e) -> None:
-        if self.checking_updates or self.busy or self.loading or not self._compatible():
+            self._prepare_install({"project_id": updates[0].version["project_id"], "title": f"{len(updates)} mods"}, updates=updates)
             return
-        manager, profile, generation = self.manager, self.profile.copy(), self._generation
-        release_type = self.details_page.release_filter.value
-        activity = track_progress(self._progress, "Checking mod updates...", priority=40)
-        self._update_activity = activity
-        self.checking_updates = True
+        if not self._compatible() or self._busy or self._checking:
+            return
+        self._identity_task.invalidate()
+        self._checking = True
+        manager, profile, release = self.manager, dict(self.profile), self._release
         self._render()
-        self._update()
-        try:
-            result = await asyncio.to_thread(manager.check_updates, self.client,
-                                             profile["minecraft_version"], profile["loader"].lower(),
-                                             release_type=release_type, loader_version=profile.get("loader_version", ""),
-                                             version_id=profile.get("version_id", ""))
-            if (generation != self._generation or manager is not self.manager or not self._active
-                    or self._update_activity is not activity
-                    or release_type != self.details_page.release_filter.value):
-                return
+
+        def operation():
+            self.client.clear_cache()
+            return manager.check_updates(self.client, profile["minecraft_version"], profile["loader"].lower(),
+                                         loader_version=profile.get("loader_version", ""), release_type=release,
+                                         version_id=profile.get("version_id", ""))
+
+        def ready(result: UpdateCheck) -> None:
+            self._checking = False
             self.local_mods = list(result.mods)
             self._apply_update_check(result)
             if result.warnings:
-                self._show_notification("\n".join(result.warnings[:4]), "warning", "Mod updates")
-            if self._details_open:
-                self.details_page.sync_local(self.local_mods)
-        except Exception as error:
-            if generation == self._generation and self._active:
-                self._show_notification(str(error), "error", "Could not check updates")
-        finally:
-            activity.finish()
-            if self._update_activity is activity:
-                self._update_activity = None
-                self.checking_updates = False
-                self._render()
-                self._update()
-
-    async def _restore_scroll(self, generation: int, offset: float) -> None:
-        await asyncio.sleep(0.06)
-        if (generation == self._generation and offset == self._saved_scroll
-                and self._active and not self._details_open and not self._selection_open):
-            if (self.list_body.content is not self.list_view
-                    or self._page.session.index.get(self.list_view.content._i) is not self.list_view.content):
-                return
-            try:
-                await self.list_view.scroll_to(offset=offset)
-                if generation == self._generation and self._saved_scroll == offset:
-                    self._saved_scroll = 0
-            except RuntimeError:
-                pass
-
-    def open_details(self, item: LocalMod | dict, profile_id: str | None = None) -> None:
-        if not self._compatible() or self._operation_in_progress or self._selection_open or (profile_id and profile_id != self.profile.get("id")):
-            return
-        self._saved_scroll = self.list_view._scroll_pixels
-        self._details_open = True
-        self.list_reveal.finish(update=False)
-        self.listing.visible = False
-        self.details_host.visible = True
-        self.details_page.open(item)
-        self._update()
-
-    def close_details(self) -> None:
-        was_open = self._details_open
-        self._details_open = False
-        self.listing.visible = not self._selection_open
-        self.details_host.visible = False
-        self.details_page.suspend()
-        self._update()
-        if was_open and self._active and self._saved_scroll:
-            self._page.run_task(self._restore_scroll, self._generation, self._saved_scroll)
-
-    async def _load(self, generation: int, profile: dict, manager: ModManager,
-                    view: str, query: str, sort: str, offset: int, activity: ProgressTask) -> None:
-        local, data, error = [], None, ""
-        provider = self.provider
-        saved_check = None
-        release_type = self.details_page.release_filter.value
-        try:
-            try:
-                if generation != self._generation:
-                    return
-                local = await asyncio.to_thread(manager.list_mods)
-                saved_check = await asyncio.to_thread(manager.cached_update_check, profile["minecraft_version"], profile["loader"].lower(),
-                                                      loader_version=profile.get("loader_version", ""), release_type=release_type,
-                                                      version_id=profile.get("version_id", ""))
-                if generation != self._generation:
-                    return
-                if view == "browse":
-                    provider_args = {"provider": provider} if provider == "curseforge" else {}
-                    data = await asyncio.to_thread(
-                        self.client.search, query, profile["minecraft_version"], profile["loader"].lower(),
-                        index=sort, offset=offset, limit=self.PAGE_SIZE, **provider_args,
-                    )
-            except Exception as exc:
-                error = str(exc)
-            if generation != self._generation:
-                return
-            # Disk/network work runs immediately. Expensive row patches wait
-            # until the client has painted the entrance instead of starving it.
-            if self._entrance:
-                await self._entrance.wait_until_finished()
-            await self.list_reveal.wait_until_finished()
-            if generation != self._generation:
-                return
-            self.error = error
-            if not error:
-                self.local_mods = local
-                if release_type == self.details_page.release_filter.value:
-                    self._apply_update_check(saved_check, saved=True)
-                if self._details_open:
-                    self.details_page.sync_local(local)
-                if data is not None:
-                    self.hits = data["hits"]
-                    self.total_hits = int(data.get("total_hits", 0))
-            reveal_results = self.list_body.content is not self.list_view
-            self.loading = False
+                self._notify("\n".join(result.warnings[:4]))
             self._render()
-            if reveal_results and self._active and not self._details_open and not self._selection_open:
-                self.list_reveal.show(self.list_body, [self.list_body])
-            self._update()
-            if self._saved_scroll and self._active:
-                self._page.run_task(self._restore_scroll, generation, self._saved_scroll)
-            if not self.error and self._active:
-                self._page.run_task(self._load_project_artwork, local)
-                if any(not mod.project_id for mod in local):
-                    self._page.run_task(self._identify_external_mods, generation, manager)
-        finally:
-            activity.finish()
-            if self._load_activity is activity:
-                self._load_activity = None
+            self._sync_details()
 
-    async def _load_project_artwork(self, mods: list[LocalMod]) -> None:
-        targets = {mod.project_id for mod in mods if mod.project_id and (not mod.icon or not mod.description)
-                   and mod.project_id not in self._project_cache and mod.project_id not in self._project_requests}
-        self._project_requests.update(targets)
-        semaphore = asyncio.Semaphore(4)
-
-        async def load(project_id: str) -> None:
-            try:
-                async with semaphore:
-                    project = await asyncio.to_thread(self.client.project, project_id)
-                    self._project_cache[project_id] = project
-            except Exception:
-                # Optional artwork must never prevent offline mod management.
-                pass
-            finally:
-                self._project_requests.discard(project_id)
-
-        if targets:
-            activity = track_progress(self._progress if self._active else None, "Loading mod artwork...", priority=10, delay=0.3)
-            self._artwork_activities.add(activity)
-            try:
-                await asyncio.gather(*(load(project_id) for project_id in targets))
-            finally:
-                activity.finish()
-                self._artwork_activities.discard(activity)
-            # Only rebuild current rows from the shared project cache; never
-            # restore a list or action captured before navigation or searching.
-            if self._entrance:
-                await self._entrance.wait_until_finished()
-            await self.list_reveal.wait_until_finished()
-            if self._active and self.view == "installed" and any(mod.project_id in targets for mod in self.local_mods):
-                self._render_list()
-                self._update()
-
-    async def _identify_external_mods(self, generation: int, manager: ModManager) -> None:
-        try:
-            mods, _ = await asyncio.to_thread(manager.identify_mods, self.client)
-        except (ConnectionError, OSError, ValueError):
-            return
-        if generation != self._generation or manager is not self.manager or not self._active:
-            return
-        if self._entrance:
-            await self._entrance.wait_until_finished()
-        await self.list_reveal.wait_until_finished()
-        if generation != self._generation or manager is not self.manager or not self._active:
-            return
-        if mods != self.local_mods:
-            self.local_mods = mods
-            if self._details_open:
-                self.details_page.sync_local(mods)
+        def failed(error: Exception) -> None:
+            self._checking = False
+            self._notify(str(error))
             self._render()
-            self._update()
-            self._page.run_task(self._load_project_artwork, mods)
 
-    def _search_changed(self, e) -> None:
-        if self._operation_in_progress:
-            return
-        self.queries[self.view] = self.search.value or ""
-        if self.view == "installed":
-            self._saved_scroll = 0
-            self._render_list()
-            self._update()
-        else:
-            self._generation += 1
-            self._finish_load_activity()
-            self.loading = True
-            self._render()
-            self._update()
-            self._page.run_task(self._debounced_search, self._generation)
+        self._check_task.submit(operation, ready, failed)
 
-    async def _debounced_search(self, generation: int) -> None:
-        await asyncio.sleep(0.35)
-        if generation == self._generation and self._active and not self._operation_in_progress:
-            self.search_offset = 0
-            self.refresh()
-
-    def _search_submitted(self, e) -> None:
-        if not self._operation_in_progress:
-            self.search_offset = 0
-            self.refresh()
-
-    def _filter_changed(self, e) -> None:
-        if self._operation_in_progress:
-            return
-        self._saved_scroll = 0
-        self._render_list()
-        self._update()
-
-    def _sort_changed(self, e) -> None:
-        if self._operation_in_progress:
-            return
-        self.search_offset = 0
-        self.refresh()
-
-    def _provider_changed(self, e) -> None:
-        provider = self.provider_selector.value
-        if provider not in {"modrinth", "curseforge"} or provider == self.provider or self._operation_in_progress:
-            return
-        self._provider_states[self.provider] = (self.search.value or "", self.sort.value, self.search_offset)
-        self.provider = provider
-        query, sort, offset = self._provider_states.get(provider, ("", "downloads", 0))
-        self.search.value = self.queries["browse"] = query
-        self.sort.value = sort
-        self.search_offset = offset
-        self.hits = []
-        self.total_hits = 0
-        self._saved_scroll = 0
-        self.list_view._scroll_pixels = 0
-        self.refresh(animate_list=True)
-
-    def _configure_curseforge(self, e) -> None:
-        curseforge = getattr(self.client, "curseforge", None)
-        if curseforge is None or self._operation_in_progress:
-            return
-        field = SimpleInput(hint_text="CurseForge API key", password=True,
-                            can_reveal_password=True, tooltip="Paste your launcher API key")
-
-        def close(e) -> None:
-            field.value = ""
-            self._dialogs().close()
-
-        async def save(e) -> None:
-            value = field.value or ""
-            try:
-                saved = await asyncio.to_thread(curseforge.set_api_key, value)
-                close(e)
-                self._show_notification("CurseForge key saved securely." if saved else
-                                        "CurseForge key set for this session.", "success", "CurseForge")
-                self._project_cache.clear()
-                self.refresh()
-            except ValueError as error:
-                self._show_notification(str(error), "error", "CurseForge")
-
-        async def remove(e) -> None:
-            await asyncio.to_thread(curseforge.clear_api_key)
-            close(e)
-            self.refresh()
-
-        from wisc.ui.mod_details import open_link
-        key_link = ft.TextButton(
-            content=ft.Text("Get an API key", size=13),
-            style=ft.ButtonStyle(
-                color={ft.ControlState.HOVERED: theme.ACCENT, ft.ControlState.DEFAULT: theme.NAV_MUTED},
-                bgcolor=theme.TRANSPARENT, overlay_color=theme.TRANSPARENT,
-                padding=ft.Padding.symmetric(horizontal=8, vertical=0),
-            ),
-            on_click=lambda e: open_link("https://console.curseforge.com/"),
-        )
-        self._dialogs().show(
-            ft.Column([_text("CurseForge requires an API key registered for your launcher. The key is stored in your system credential vault when available.", 13),
-                       field, ft.Row([key_link], tight=True)], spacing=16,
-                      horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
-            title=_text("CurseForge setup", 22, color=theme.ACCENT, emphasis=True),
-            actions=[_button("Clear key", remove), _button("Cancel", close), _button("Save key", save, primary=True)],
-            on_cancel=close, width=540, height=380,
-        )
-
-    def _paginate(self, direction: int) -> None:
-        if not self.loading and not self._operation_in_progress:
-            self.search_offset = max(0, self.search_offset + direction * self.PAGE_SIZE)
-            self.refresh()
-
-    def _render(self) -> None:
-        if self.content_type in {"shader", "resourcepack"}:
-            self.content_packs_page._render()
-            return
-        if self.content_type == "modpacks":
-            self.modpacks_page._render()
-            return
-        self.content_selector.disabled = self._operation_in_progress
-        browse = self.view == "browse"
-        controls_busy = self._operation_in_progress
-        locked = controls_busy or self._is_running()
-        self.select_profile_button.disabled = controls_busy
-        self.installed_tab.disabled = controls_busy or not self._compatible()
-        self.browse_tab.disabled = controls_busy or not self._compatible()
-        for tab, selected in ((self.installed_tab, not browse), (self.browse_tab, browse)):
-            select_tab(tab, selected and self._compatible())
-        self.installed_tab.content.value = f"Installed · {len(self.local_mods)}" if self._compatible() else "Installed"
-        self.attribution.visible = browse and self._compatible()
-        self.attribution.value = "Powered by CurseForge" if self.provider == "curseforge" else "Powered by Modrinth"
-        self.update_button.visible = not browse and self._compatible()
-        self.update_button.disabled = self.busy or self.loading or self.checking_updates or not self.local_mods or bool(self._updates and self._is_running())
-        self.update_button.content.value = "Checking..." if self.checking_updates else "Update all" if self._updates else "Check updates"
-        self.update_button.tooltip = "Review and update all found mods" if self._updates else "Check for newer compatible mod versions"
-        self.refresh_button.tooltip = "Refresh mods and clear the saved update check" if self._update_summary else "Refresh mods"
-        self.details_page.release_filter.disabled = controls_busy
-        self.search.hint_text = "Search compatible mods" if browse else "Search installed mods"
-        self.filter.visible = not browse
-        self.sort.visible = browse
-        self.provider_selector.visible = browse
-        self.provider_selector.disabled = controls_busy
-        self.curseforge_setup_button.visible = browse and self.provider == "curseforge"
-        self.curseforge_setup_button.disabled = controls_busy
-        self.add_button.visible = not browse
-        self.add_button.disabled = locked or not self._compatible()
-        self.search.disabled = controls_busy or not self._compatible()
-        self.sort.disabled = controls_busy
-        self.filter.disabled = controls_busy
-        self.refresh_button.visible = self._compatible()
-        self.refresh_button.disabled = controls_busy or self.loading
-        self.toolbar.visible = self._compatible()
-        self._render_list()
-        if self._details_open:
-            self.details_page._render_header()
-            self.details_page._update()
-
-
-    def _empty(self, title: str, description: str, action: ft.Control | None = None) -> None:
-        self.list_view.set_items([], self._cached_row)
-        controls = [launcher_asset_icon(src="sidebar/mods_muted.png", color=theme.NAV_MUTED,
-                                       width=44, height=44, fit=ft.BoxFit.CONTAIN),
-                    _text(title, 20, color=theme.TEXT, emphasis=True),
-                    ft.Container(width=560, content=_text(description, 13, text_align=ft.TextAlign.CENTER, max_lines=4))]
-        if action:
-            controls.append(action)
-        self.list_body.content = ft.Container(
-            expand=True, alignment=ft.Alignment.CENTER, padding=24,
-            content=ft.Column(controls, spacing=12, tight=True,
-                              horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-        )
-
-    def _render_list(self) -> None:
-        browse = self.view == "browse"
-        self.previous.visible = self.next.visible = self.page_label.visible = browse and self.total_hits > 0
-        self.pagination.visible = browse and self.total_hits > self.PAGE_SIZE and self._compatible() and not self.error
-        self.previous.disabled = self.search_offset == 0 or self.loading or self._operation_in_progress
-        self.next.disabled = self.search_offset + self.PAGE_SIZE >= self.total_hits or self.loading or self._operation_in_progress
-        self.page_label.value = f"{self.search_offset // self.PAGE_SIZE + 1} / {max(1, (self.total_hits + self.PAGE_SIZE - 1) // self.PAGE_SIZE)}"
-        self.status.value = "Finding compatible mods..." if self.loading and browse else "Reading mods..." if self.loading else ""
-        self.status.visible = bool(self.status.value) or self.busy
-        self.status_row.visible = self.status.visible or self.pagination.visible
-        if self.error:
-            self._empty("Could not load mods", self.error, _button("Retry", self._refresh_requested))
-            return
-        if not self.profile:
-            self._empty("Choose your modded profile", "Create a Fabric, Forge, NeoForge, or Quilt profile to get started.", _button("Create profile", lambda e: self._create_profile(), primary=True))
-            return
-        if not self.profile.get("is_instance"):
-            self.status_row.visible = self.status.visible = False
-            self._empty("This profile is not an instance",
-                        "This profile uses the global Minecraft folder. Adding mods there can load them in other profiles, causing incompatible versions, conflicts, or crashes. Create a separate instance to keep its mods isolated.",
-                        _button("Create instance", lambda e: self._create_profile(), primary=True))
-            return
-        if not self._compatible():
-            self._empty("This profile needs a mod loader", "Choose a Fabric, Forge, NeoForge, or Quilt profile with a Minecraft version.", _button("Create profile", lambda e: self._create_profile(), primary=True))
-            return
-        if self.loading and not (self.hits if browse else self.local_mods):
-            self._empty("Finding mods" if browse else "Reading mods", "This will only take a moment.")
-            return
-        self.list_body.content = self.list_view
-        self.status_row.visible = True
-        if browse:
-            noun = "mod" if self.total_hits == 1 else "mods"
-            self.status.value = "Finding compatible mods..." if self.loading else f"{self.total_hits:,} compatible {noun}"
-            self.status.visible = True
-            self.list_view.set_items(self.hits, self._cached_row, offset=self._saved_scroll or self.list_view._scroll_pixels)
-            if not self.hits:
-                self._empty("No compatible mods found", "Try another search. Results match this profile's Minecraft version and loader.")
-        else:
-            query = (self.search.value or "").casefold().strip()
-            state_filter = self.filter.value
-            mods = [item for item in self.local_mods
-                    if (not query or query in f"{item.name} {item.filename} {item.mod_id}".casefold())
-                    and (state_filter == "all" or item.enabled == (state_filter == "enabled"))]
-            enabled = sum(item.enabled for item in self.local_mods)
-            disabled = len(self.local_mods) - enabled
-            self.status.value = f"{enabled} enabled" + (f" · {disabled} disabled" if disabled else "")
-            if query or state_filter != "all":
-                self.status.value = f"{len(mods)} of {len(self.local_mods)} mods · " + self.status.value
-            self.status.visible = True
-            self.installed_tab.content.value = f"Installed · {len(self.local_mods)}"
-            if self._update_summary:
-                self.status.value += " · " + self._update_summary
-            self.list_view.set_items(mods, self._cached_row, offset=self._saved_scroll or self.list_view._scroll_pixels)
-            if not mods:
-                self._empty("No matching mods" if self.local_mods else "Your next adventure starts here",
-                            "Try another search or filter." if self.local_mods else "Browse compatible mods or add your own JAR files.",
-                            None if self.local_mods else _button("Browse mods", lambda e: self.set_view("browse"), primary=True))
-
-    def _cache_live_rows(self) -> None:
-        # ProfileList reconciles by key. Cache its live mutable card, rather
-        # than a replacement object that Flet can freeze during the update.
-        for card in self.list_view.cards:
-            signature, _ = self._row_cache[card.data]
-            self._row_cache[card.data] = (signature, card)
-        live = {card.data for card in self.list_view.cards}
-        for key in list(self._row_cache):
-            if len(self._row_cache) <= self.ROW_CACHE_SIZE:
-                break
-            if key not in live:
-                del self._row_cache[key]
-
-    def _cached_row(self, item: LocalMod | dict) -> ft.Container:
-        key = (self.view, item.filename if isinstance(item, LocalMod) else item["project_id"])
-        project = self._project_cache.get(item.project_id, {}) if isinstance(item, LocalMod) else {}
-        signature = (item, self._operation_in_progress, self._is_running(), project.get("icon_url"), project.get("description"),
-                     tuple((m.project_id, m.enabled) for m in self.local_mods) if isinstance(item, dict)
-                     else self._updates.get(item.filename))
-        cached = self._row_cache.get(key)
-        if cached and cached[0] == signature:
-            return cached[1]
-        card = self._local_row(item) if isinstance(item, LocalMod) else self._browse_row(item)
-        card.data = key
-        card.key = ft.ValueKey(f"mod-{key[0]}-{key[1]}")
-        card.margin = ft.Margin.only(bottom=8)
-        self._row_cache[key] = (signature, card)
-        return card
-
-    def _surface(self, content: ft.Control) -> ft.Container:
-        return card_surface(content, glow_color=theme.GLOW, horizontal_padding=16)
-
-    def _mod_icon(self) -> ft.Control:
-        return rounded_artwork(
-            launcher_asset_icon(src="sidebar/mods.png", width=34, height=34, fit=ft.BoxFit.CONTAIN,
-                     filter_quality=ft.FilterQuality.NONE), size=34)
-
-    def _mod_info(self, title: ft.Text, description: str, details: ft.Control) -> ft.Column:
-        lines = [title]
-        if description:
-            lines.append(_text(description, 13, color=theme.TEXT_SECONDARY, max_lines=1,
-                               overflow=ft.TextOverflow.ELLIPSIS))
-        lines.append(details)
-        return ft.Column(lines, expand=True, spacing=4, tight=True)
-
-    def _local_row(self, mod: LocalMod) -> ft.Container:
-        locked = self._operation_in_progress or self._is_running()
-        manager = self.manager
-        profile_id = self.profile.get("id")
-        project = self._project_cache.get(mod.project_id, {})
-        source = mod.icon or project.get("icon_url")
-        update = self._updates.get(mod.filename)
-        icon = ft.Image(src=source, width=48, height=48, fit=ft.BoxFit.CONTAIN,
-                        cache_width=128, gapless_playback=True,
-                        filter_quality=ft.FilterQuality.NONE,
-                        error_content=self._mod_icon()) if source else self._mod_icon()
-        return self._surface(ft.Row([
-            ft.GestureDetector(content=ft.Row([
-                ft.Container(rounded_artwork(icon, size=48), opacity=1 if mod.enabled else 0.45, width=48),
-                self._mod_info(
-                    _text(mod.name, 15, color=theme.TEXT if mod.enabled else theme.MUTED, emphasis=True,
-                          max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                    mod.description or project.get("description", ""),
-                    _text(" · ".join(value for value in (mod.version, _size(mod.size), "Pack managed" if mod.pack_owned else "") if value),
-                          12, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)),
-            ], spacing=16), expand=True, on_tap=lambda e, item=mod: self.open_details(item, profile_id),
-                mouse_cursor=ft.MouseCursor.CLICK, tooltip=f"View {mod.name}"),
-            _text("Enabled" if mod.enabled else "Disabled", 11, width=55),
-            _button("Update", lambda e, target=update: self._page.run_task(
-                self._prepare_install, {"project_id": target.mod.project_id, "title": target.mod.name},
-                target.version, profile_id, target), disabled=locked,
-                tooltip="Review update and required dependencies") if update else ft.Container(width=0),
-            ft.Switch(value=mod.enabled, active_color=theme.ACCENT, active_track_color=theme.opacity(0.38, theme.ACCENT),
-                      inactive_thumb_color=theme.MUTED, inactive_track_color=theme.SWITCH_INACTIVE_TRACK, disabled=locked,
-                      tooltip="Disable mod" if mod.enabled else "Enable mod",
-                      on_change=lambda e, item=mod: self._page.run_task(self._toggle, item, bool(e.control.value), manager)),
-            launcher_icon_button(icon=ft.Icons.DELETE_OUTLINE_SHARP, icon_color=theme.MUTED, icon_size=19,
-                          tooltip="Remove mod", disabled=locked, on_click=lambda e, item=mod: self._confirm_remove(item, manager)),
-        ], spacing=8))
-
-    def _browse_row(self, hit: dict) -> ft.Container:
-        profile_id = self.profile.get("id")
-        project_id = hit.get("project_id", "")
-        installed = next((item for item in self.local_mods if item.project_id == project_id), None)
-        icon_url = hit.get("icon_url")
-        icon = ft.Image(src=icon_url, width=48, height=48, fit=ft.BoxFit.CONTAIN,
-                        cache_width=128, gapless_playback=True,
-                        filter_quality=ft.FilterQuality.NONE,
-                        error_content=self._mod_icon()) if icon_url else self._mod_icon()
-        install_button = launcher_icon_button(
-            icon=ft.Icons.CHECK_SHARP if installed else ft.Icons.DOWNLOAD_ROUNDED,
-            icon_color=theme.MUTED if installed else theme.ON_ACCENT, primary=not installed,
-            width=44, height=44, icon_size=22,
-            on_click=lambda e, item=hit: self._page.run_task(self._prepare_install, item, None, profile_id),
-            tooltip="Installed" if installed else f"Install {hit.get('title', 'mod')}",
-            disabled=bool(installed) or self._operation_in_progress or self._is_running(),
-        )
-        return self._surface(ft.Row([
-            ft.GestureDetector(content=ft.Row([
-                rounded_artwork(icon, size=48),
-                self._mod_info(
-                    _text(hit.get("title", "Unnamed mod"), 15, color=theme.TEXT, emphasis=True,
-                          max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                    hit.get("description", ""),
-                    _text(f"{hit.get('author', 'Unknown')} · {_downloads(hit.get('downloads', 0))} downloads",
-                          12, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)),
-            ], spacing=16), expand=True, on_tap=lambda e, item=hit: self.open_details(item, profile_id),
-                mouse_cursor=ft.MouseCursor.CLICK, tooltip=f"View {hit.get('title', 'mod')}"),
-            install_button,
-        ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER))
-
-
-    def _can_change(self, target_manager: ModManager | None = None) -> bool:
-        if self._operation_in_progress or self._is_running():
-            self._show_notification("Wait for the current operation or close Minecraft before changing mods.", "warning")
+    def _can_operate(self) -> bool:
+        if self._busy or self._review or self._is_running() or (self.kind != "modpacks" and not self._can_browse()):
+            self._notify("Choose a compatible profile and close Minecraft before changing content.")
             return False
-        if target_manager is not None:
-            if not target_manager.game_directory.is_dir():
-                self._show_notification("The original instance folder is missing. Restore it before undoing this removal.", "warning")
-                return False
-            return True
-        return self._compatible()
+        return True
 
-    async def _run_mutation(self, manager: ModManager, operation: Callable, message: str,
-                            *, success_action: tuple[str, Callable] | None = None,
-                             activity: ProgressTask | None = None,
-                             require_selected: bool = True) -> None:
-        if ((require_selected and manager is not self.manager)
-                or not self._can_change(None if require_selected else manager)):
-            self._render()
-            self._update()
+    def _validate_target(self, profile: dict) -> None:
+        current = next((item for item in self._get_profiles() if item.get("id") == profile["id"]), None)
+        if _profile_key(current) != _profile_key(profile):
+            raise ValueError("The target profile changed. Refresh and review the installation again.")
+        if not Path(self._game_directory(profile)).is_dir():
+            raise ValueError("The target instance folder is missing. Restore it before changing content.")
+
+    def _commit_guard(self, progress: ServiceProgress, profile: dict | None = None) -> bool:
+        progress.check_cancelled()
+        if self._closing or self._is_running():
+            return False
+        if profile:
+            self._validate_target(profile)
+        progress.seal_commit()
+        return True
+
+    def _execute(self, operation: Callable[[ServiceProgress], Any], message: str, success: Callable,
+                 *, phase: str = "installing") -> None:
+        if self._busy or self._closing:
             return
-        self.busy = True
-        activity = activity or track_progress(self._progress, "Updating mods...", priority=100)
-        self._generation += 1
-        self._finish_load_activity()
-        self._finish_update_activity()
-        self.loading = False
+        self._invalidate_reads()
+        self._busy, self._phase = True, phase
+        progress = self._progress = ServiceProgress(message, self)
+        progress.changed.connect(lambda text, current, total: self.progress_changed.emit(text, current, total, True))
+        self.progress_changed.emit(message, 0, None, True)
         self._render()
-        self._update()
-        try:
-            await asyncio.to_thread(operation)
-            options = {"action_label": success_action[0], "on_action": success_action[1]} if success_action else {}
-            self._show_notification(message, "success", "Mods", **options)
-            self._on_changed()
-        except Exception as error:
-            self._show_notification(str(error), "error", "Could not change mods")
-        finally:
-            activity.finish()
-            self.busy = False
+
+        def finish() -> None:
+            progress.finish()
+            progress.deleteLater()
+            self._progress = None
+            self._operation_token = None
+            self._busy, self._phase = False, "idle"
+            self.progress_changed.emit("", 0, None, False)
+
+        def ready(value) -> None:
+            finish()
+            if self._closing:
+                return
+            success(value)
+            self._render()
+
+        def failed(error: Exception) -> None:
+            finish()
+            if self._closing:
+                return
+            self._notify(str(error))
+            self._render()
+            if self._active:
+                self._scan_installed()
+                self._load_browse()
+
+        self._operation_token = self.runner.submit(lambda: operation(progress), ready, failed)
+
+    def cancel_operation(self) -> None:
+        if self._progress:
+            if self._progress.cancel():
+                self.progress_changed.emit("Canceling…", 0, None, True)
+            else:
+                self.progress_changed.emit("Finishing installation…", 0, None, True)
+
+    def _show_review(self, dialog: ReviewDialog, *, on_cancel: Callable | None = None) -> None:
+        self._review = dialog
+        dialog.link_requested.connect(self._open_link)
+
+        def finished(result: int) -> None:
+            if self._review is dialog:
+                self._review = None
+            if result != ReviewDialog.DialogCode.Accepted and on_cancel is not None:
+                on_cancel()
+            self._render()
+            if not self._busy and self._active:
+                self._scan_installed()
+                self._load_browse()
+
+        dialog.finished.connect(finished)
+        self._render()
+        dialog.open()
+
+    def _row_action(self, item: ContentItem, action: str) -> None:
+        if item is None:
+            return
+        payload = item.payload
+        if action == "install":
+            self._prepare_install(payload)
+        elif action == "update" and isinstance(payload, LocalMod):
+            update = self._updates.get(payload.filename)
+            if update:
+                self._prepare_install({"project_id": update.version["project_id"], "title": payload.name}, updates=(update,))
+        elif action == "toggle":
+            local = self.details._local if item is self._detail_item else payload
+            if isinstance(local, LocalMod):
+                self._toggle(local)
+        elif action == "remove":
+            local = self.details._local if item is self._detail_item else payload
+            if isinstance(local, (LocalMod, LocalContentPack)):
+                self._confirm_remove(local)
+        elif action == "mods" and isinstance(payload, dict):
+            self.enter(payload["id"])
+        elif action == "folder" and isinstance(payload, dict):
+            self.runner.submit(lambda: self._game_directory(payload),
+                               lambda folder: QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))),
+                               lambda error: self._notify(str(error)))
+
+    def _toggle(self, mod: LocalMod) -> None:
+        if not self._can_operate():
+            return
+        manager, profile = self.manager, dict(self.profile)
+
+        def operation(progress):
+            if not self._commit_guard(progress, profile):
+                raise ValueError("Close Minecraft before changing mods.")
+            manager.set_enabled(mod.filename, not mod.enabled)
+
+        self._execute(operation, "Updating mod…", lambda result:
+                      self._changed(f"{mod.name} {'disabled' if mod.enabled else 'enabled'}."))
+
+    def _add_files(self) -> None:
+        if not self._can_operate():
+            return
+        if self.kind == "modpacks":
+            files, _ = QFileDialog.getOpenFileNames(self, "Import Minecraft modpack", "", "Modpacks (*.mrpack *.zip)")
+            if files:
+                self._prepare_pack(path=Path(files[0]))
+            return
+        files, _ = QFileDialog.getOpenFileNames(self, "Add Minecraft mod JARs", "", "JAR files (*.jar)")
+        if not files:
+            return
+        manager, profile, paths = self.manager, dict(self.profile), [Path(file) for file in files]
+
+        def operation(progress):
+            if not self._commit_guard(progress, profile):
+                raise ValueError("Close Minecraft before changing mods.")
+            return manager.import_jars(paths, loader=profile["loader"].lower(), loader_version=profile.get("loader_version", ""))
+
+        self._execute(operation, "Adding local mods…", lambda count: self._changed(f"Added {count} mods."))
+
+    def _confirm_remove(self, item: LocalMod | LocalContentPack) -> None:
+        if not self._can_operate():
+            return
+        manager, profile = self.manager or self.content_manager, dict(self.profile)
+        name = item.name if isinstance(item, LocalMod) else item.title
+        dialog = ReviewDialog("Remove " + name, self.runner, self, action="Remove")
+        note = text_label(f"Remove {item.filename} from {profile.get('name', 'this profile')}?" +
+                          (" You can undo this removal." if isinstance(item, LocalMod) else ""), theme.FONT_BODY)
+        note.setWordWrap(True)
+        dialog.body.addWidget(note)
+        dialog.resize(600, 280)
+
+        def remove() -> None:
+            self._review = None
+
+            def operation(progress):
+                if not self._commit_guard(progress, profile):
+                    raise ValueError("Close Minecraft before removing content.")
+                return manager.remove(item.filename) if isinstance(item, LocalMod) else manager.remove(item, can_commit=lambda: not self._is_running())
+
+            def ready(token) -> None:
+                self._changed(f"Removed {name}.", undo=(manager, token, name) if isinstance(item, LocalMod) else None)
+
+            self._execute(operation, "Removing content…", ready)
+
+        dialog.accepted.connect(remove)
+        self._show_review(dialog)
+
+    def _undo_remove(self) -> None:
+        if not self._undo or self._busy or self._review or self._is_running():
+            return
+        manager, token, name = self._undo
+
+        def operation(progress):
+            if not manager.game_directory.is_dir():
+                raise ValueError("The original instance folder is missing. Restore it before undoing removal.")
+            if not self._commit_guard(progress):
+                raise ValueError("Close Minecraft before restoring mods.")
+            manager.restore(token)
+
+        def restored(result) -> None:
+            self._undo = None
+            self._changed(f"Restored {name}.")
+
+        self._execute(operation, "Restoring mod…", restored)
+
+    def _changed(self, message: str, *, undo: tuple[ModManager, str, str] | None = None) -> None:
+        self.content_changed.emit()
+        self._notify(message, undo=undo)
+        self._apply_update_check(None)
+        if self._active:
+            self._scan_installed()
+            self._load_browse()
+            if self._detail_item is not None:
+                self._load_details()
+
+    def _prepare_install(self, project: dict, selected_version: dict | None = None, *, updates: tuple[ModUpdate, ...] = ()) -> None:
+        if not self._can_operate():
+            return
+        if self.kind == "modpacks":
+            self._prepare_pack(project=project, version=selected_version)
+            return
+        if self.kind in {"shader", "resourcepack"}:
+            self._prepare_content(project, selected_version)
+            return
+        manager, profile, release = self.manager, dict(self.profile), self._release
+
+        def operation(progress):
+            progress.check_cancelled()
+            self._validate_target(profile)
+            if updates:
+                plan = manager.plan_updates(self.client, updates, profile["minecraft_version"], profile["loader"].lower(),
+                                             loader_version=profile.get("loader_version", ""), release_type=release,
+                                             version_id=profile.get("version_id", ""))
+            else:
+                plan = manager.plan_install(self.client, project["project_id"], profile["minecraft_version"], profile["loader"].lower(),
+                                             selected_version=selected_version, loader_version=profile.get("loader_version", ""),
+                                             version_id=profile.get("version_id", ""))
+            progress.check_cancelled()
+            manual = [file for version in plan.versions if (file := primary_file(version)).get("manual_required")]
+            return plan, manual_ready_ids(self.client, manual)
+
+        def ready(result) -> None:
+            plan, ids = result
+            if not plan.versions:
+                self._notify("This mod is already installed.")
+                return
+            if not self._active:
+                return
+            review = ModInstallReview(project, profile, plan, manager, self.client, self.runner, self.images, self,
+                                      ready_ids=ids, updates=updates)
+
+            def install(confirmed: InstallPlan) -> None:
+                self._review = None
+
+                def operation(progress):
+                    self._validate_target(profile)
+                    return manager.install(self.client, confirmed, progress,
+                                           can_commit=lambda: self._commit_guard(progress, profile))
+
+                self._execute(operation, "Downloading mods…", lambda count:
+                              self._changed(f"Updated {len(updates)} mods." if updates else f"Installed {project.get('title', 'mod')}."))
+
+            review.install_requested.connect(install)
+            self._show_review(review)
+
+        self._execute(operation, "Checking mod dependencies…", ready, phase="preparing")
+
+    def _prepare_content(self, project: dict, selected_version: dict | None) -> None:
+        manager, profile, kind = self.content_manager, dict(self.profile), self.kind
+
+        def operation(progress):
+            self._validate_target(profile)
+            full = self.client.content_project(project["project_id"], kind)
+            versions = self.client.content_versions(project["project_id"], profile["minecraft_version"], kind)
+            if not versions:
+                raise ValueError("No compatible pack version is available for this profile.")
+            if selected_version and not any(version["id"] == selected_version["id"] for version in versions):
+                raise ValueError("This version is no longer compatible with the selected profile.")
+            manual = [file for version in versions if (file := primary_content_file(version)).get("manual_required")]
+            ids = manual_ready_ids(self.client, manual)
+            progress.check_cancelled()
+            return full, versions, ids
+
+        def ready(result) -> None:
+            full, versions, ids = result
+            if not self._active:
+                return
+            selected = selected_version or next((version for version in versions if version.get("version_type") == "release"), versions[0])
+            review = ContentInstallReview(full, profile, versions, self.client, self.runner, self, selected=selected, ready_ids=ids)
+
+            def install(version: dict) -> None:
+                self._review = None
+
+                def operation(progress):
+                    self._validate_target(profile)
+                    return manager.install(self.client, full, version, profile["minecraft_version"], progress,
+                                           can_commit=lambda: self._commit_guard(progress, profile))
+
+                self._execute(operation, "Downloading pack…", lambda path: self._changed(f"Installed {full.get('title', 'pack')}."))
+
+            review.install_requested.connect(install)
+            self._show_review(review)
+
+        self._execute(operation, "Finding compatible pack versions…", ready, phase="preparing")
+
+    def _installer(self) -> PackInstaller:
+        if self._pack_installer is None:
+            self._pack_installer = PackInstaller(self._runtime_directory or _runtime_directory(), client=self.client)
+        return self._pack_installer
+
+    def _suggest_folder(self, installer: PackInstaller, plan: PackPlan) -> str:
+        from wisc.services.profiles import instance_folder_name, new_instance_directory
+        base = instance_folder_name("", plan.name)[:100]
+        profiles = installer.storage.load_installations()
+        for number in range(1, 10001):
+            folder = base if number == 1 else f"{base}_{number}"
+            try:
+                new_instance_directory(installer.minecraft_directory, folder, plan.name, profiles)
+                return folder
+            except FileExistsError:
+                continue
+        raise ValueError("Choose a different instance folder name for this pack.")
+
+    def _prepare_pack(self, *, project: dict | None = None, version: dict | None = None, path: Path | None = None) -> None:
+        def operation(progress):
+            installer = self._installer()
+            plan = None
+            try:
+                if path is not None:
+                    plan = installer.prepare_local(path, progress=progress, cancel_event=progress.cancel_event)
+                else:
+                    identifier = project.get("project_id") or project["id"]
+                    full = self.client.modpack_project(identifier)
+                    versions = self.client.modpack_versions(identifier) if version is None else [version]
+                    selected = version or next((entry for entry in versions if entry.get("version_type") == "release"), versions[0] if versions else None)
+                    if selected is None:
+                        raise ValueError("This modpack has no supported client release.")
+                    selected = self.client.modpack_version(selected["id"])
+                    provider = "curseforge" if identifier.startswith("cf:") else "modrinth"
+                    file = installer.archive_file(selected, provider)
+                    if file.get("manual_required") and not self.client.is_manual_file_ready(file):
+                        progress.check_cancelled()
+                        return {"archive": True, "project": full, "versions": [selected]}
+                    plan = installer.prepare_remote(full, selected, progress=progress, cancel_event=progress.cancel_event)
+                folder = self._suggest_folder(installer, plan)
+                ids = manual_ready_ids(self.client, plan.manual_files())
+                self._pack_plan = plan
+                progress.check_cancelled()
+                if self._closing:
+                    raise OperationCancelled("Modpack preparation canceled.")
+                return {"plan": plan, "installer": installer, "folder": folder, "ready_ids": ids}
+            except BaseException:
+                installer.discard(plan)
+                if self._pack_plan is plan:
+                    self._pack_plan = None
+                raise
+
+        def ready(result: dict) -> None:
+            if result.get("archive"):
+                if not self._active:
+                    return
+                review = ContentInstallReview(result["project"], None, result["versions"], self.client, self.runner, self, archive=True)
+
+                def selected(version: dict) -> None:
+                    self._review = None
+                    self._prepare_pack(project=result["project"], version=version)
+
+                review.install_requested.connect(selected)
+                self._show_review(review)
+                return
+            plan, installer = result["plan"], result["installer"]
+            self._pack_plan = plan
+            if not self._active:
+                self._discard_plan(installer, plan)
+                return
+            review = PackInstallReview(plan, installer, self.runner, self.images, self,
+                                       folder_name=result["folder"], ready_ids=result["ready_ids"])
+
+            def install(options: dict) -> None:
+                self._review = None
+
+                def operation(progress):
+                    try:
+                        return installer.install(plan, **options, progress=progress, cancel_event=progress.cancel_event,
+                                                 can_commit=lambda: self._commit_guard(progress))
+                    finally:
+                        installer.discard(plan)
+
+                def installed(profile: dict) -> None:
+                    self._pack_plan = None
+                    self._profiles.append(profile)
+                    self.close_details()
+                    self.set_view("installed")
+                    self._changed("Installed " + profile.get("name", "modpack") + ".")
+
+                self._execute(operation, "Installing " + plan.name + "…", installed)
+
+            review.install_requested.connect(install)
+            self._show_review(review, on_cancel=lambda: self._discard_plan(installer, plan))
+
+        self._execute(operation, "Reading modpack…", ready, phase="preparing")
+
+    def _discard_plan(self, installer: PackInstaller, plan: PackPlan) -> None:
+        self._pack_plan = None
+        if not self._closing:
+            self.runner.submit(lambda: installer.discard(plan), lambda result: None, lambda error: self._notify(str(error)))
+
+    def _configure_curseforge(self) -> None:
+        if self._busy or self._review:
+            return
+        dialog = ReviewDialog("CurseForge setup", self.runner, self, action="Save key")
+        note = text_label("Use an API key registered for your launcher. Wisc stores it in the system credential vault when available.", theme.FONT_BODY)
+        note.setWordWrap(True)
+        dialog.body.addWidget(note)
+        field = GlassLineEdit()
+        field.setEchoMode(GlassLineEdit.EchoMode.Password)
+        field.setPlaceholderText("Launcher API key")
+        field.setAccessibleName("CurseForge launcher API key")
+        field.setFixedHeight(48)
+        dialog.body.addWidget(field)
+        get_key = GlassButton("Get an API key")
+        get_key.clicked.connect(lambda: self._open_link("https://console.curseforge.com/"))
+        dialog.body.addWidget(get_key)
+        clear = GlassButton("Clear key")
+        dialog.body.addWidget(clear)
+        dialog.finished.connect(lambda result: field.clear())
+
+        def saved(persisted: bool) -> None:
+            dialog.accept()
+            self._notify("CurseForge key saved securely." if persisted else "CurseForge key set for this session.")
             self.refresh()
 
-    async def _toggle(self, mod: LocalMod, enabled: bool, source_manager: ModManager | None = None) -> None:
-        if source_manager is not None and source_manager is not self.manager:
+        def save() -> None:
+            value = field.text()
+            field.clear()
+            dialog.run(lambda: self.client.curseforge.set_api_key(value), saved)
+
+        def removed(result) -> None:
+            dialog.accept()
+            self._notify("CurseForge key cleared.")
+            self.refresh()
+
+        dialog.confirm.clicked.disconnect()
+        dialog.confirm.clicked.connect(save)
+        clear.clicked.connect(lambda: dialog.run(self.client.curseforge.clear_api_key, removed))
+        self._show_review(dialog)
+
+    def shutdown(self) -> None:
+        if self._closing:
             return
-        if self.manager:
-            manager = self.manager
-            await self._run_mutation(manager, lambda: manager.set_enabled(mod.filename, enabled), f"{mod.name} {'enabled' if enabled else 'disabled'}.")
+        pending_plan, installer, phase = self._pack_plan, self._pack_installer, self._phase
+        self._closing = True
+        if self._progress:
+            self._progress.cancel()
+            self._progress.finish()
+        if self._review:
+            self._review.reject()
+        if pending_plan and installer and phase != "installing":
+            from threading import Thread
+            Thread(target=installer.discard, args=(pending_plan,),
+                   name="Wisc pack cleanup", daemon=True).start()
+            self._pack_plan = None
+        self._invalidate_reads()
+        for task in self._read_tasks:
+            task.close()
+        self.loading_changed.emit(False)
+        self.progress_changed.emit("", 0, None, False)
+        self._managers.clear()
+        self._content_managers.clear()
+        self.images.set_visible(False)
 
-    async def _import_files(self, e) -> None:
-        if not self._can_change():
-            return
-        manager = self.manager
-        profile_id = self.profile["id"]
-        try:
-            files = await self.file_picker.pick_files(dialog_title="Add Minecraft mod JARs", file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["jar"], allow_multiple=True)
-            if not files:
-                return
-            if profile_id != (self.profile or {}).get("id"):
-                self._show_notification("The selected profile changed. Add the JARs again for the intended profile.", "warning")
-                return
-            paths = [Path(item.path) for item in files if item.path]
-            if len(paths) != len(files):
-                raise ValueError("Local JAR imports are available in the desktop launcher.")
-            profile = self.profile.copy()
-            await self._run_mutation(manager, lambda: manager.import_jars(
-                paths, loader=profile["loader"].lower(), loader_version=profile.get("loader_version", "")),
-                f"Added {len(paths)} {'mod' if len(paths) == 1 else 'mods'}.")
-        except Exception as error:
-            self._show_notification(str(error), "error", "Could not add mods")
-
-
-    def _confirm_remove(self, mod: LocalMod, source_manager: ModManager | None = None) -> None:
-        if source_manager is not None and source_manager is not self.manager:
-            return
-        if not self._can_change():
-            return
-        manager = self.manager
-        profile_name = self.profile.get("name", "this profile")
-
-        async def remove(e) -> None:
-            self._dialogs().close()
-            await asyncio.sleep(0.2)
-            removal = None
-            def operation() -> None:
-                nonlocal removal
-                token = manager.remove(mod.filename)
-                removal = self._undo = (manager, token, mod.name)
-
-            async def undo(e) -> None:
-                if removal:
-                    await self._restore_removed(e, removal)
-
-            await self._run_mutation(manager, operation, f"Removed {mod.name}.", success_action=("Undo", undo))
-
-        self._dialogs().show(
-            ft.Column([_text(f"Remove {mod.name} from {profile_name}?", 15, color=theme.TEXT),
-                       _text("The JAR will move to launcher trash. Use Undo in the notification to restore it.", 13),
-                       _text("Mods in the same game folder are shared by its profiles.", 12)], spacing=14),
-            title=_text("Remove mod", 22, color=theme.ACCENT, emphasis=True),
-            actions=[_button("Cancel", lambda e: self._dialogs().close()), _button("Remove", remove, primary=True)],
-            on_cancel=lambda e: self._dialogs().close(), width=510, height=320,
-        )
-
-    async def _restore_removed(self, e, removal: tuple[ModManager, str, str] | None = None) -> None:
-        removal = removal or self._undo
-        if not removal:
-            return
-        manager, token, name = removal
-        def operation() -> None:
-            manager.restore(token)
-            if self._undo == removal:
-                self._undo = None
-        await self._run_mutation(manager, operation, f"Restored {name}.", require_selected=False)
-
-    async def _prepare_install(self, hit: dict, selected_version: dict | None = None, profile_id: str | None = None,
-                               expected_update: ModUpdate | None = None, updates: tuple[ModUpdate, ...] = ()) -> None:
-        if profile_id and profile_id != (self.profile or {}).get("id"):
-            return
-        if not self._can_change():
-            return
-        manager = self.manager
-        profile = self.profile.copy()
-        generation = self._generation
-        self.busy = True
-        activity = track_progress(self._progress, "Checking mod version and dependencies...", priority=80)
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._active = True
+        self.images.set_visible(True)
+        if not self._busy:
+            self._reload_profiles()
         self._render()
-        self.status.value = "Checking version and required dependencies..."
-        self._update()
-        try:
-            kwargs = {"loader_version": profile.get("loader_version", ""), "version_id": profile.get("version_id", "")}
-            if selected_version:
-                kwargs["selected_version"] = selected_version
-            if updates or expected_update:
-                plan = await asyncio.to_thread(manager.plan_updates, self.client, updates or (expected_update,), profile["minecraft_version"],
-                                               profile["loader"].lower(), loader_version=profile.get("loader_version", ""),
-                                               release_type=self.details_page.release_filter.value, version_id=profile.get("version_id", ""))
-            else:
-                plan = await asyncio.to_thread(manager.plan_install, self.client, hit["project_id"], profile["minecraft_version"], profile["loader"].lower(), **kwargs)
-            if generation != self._generation or not self._active:
-                return
-            if expected_update and dict(plan.snapshot or ()).get(expected_update.mod.filename) != expected_update.sha512:
-                raise ValueError("This mod changed since the update check. Refresh and check updates again.")
-            if not plan.versions:
-                self._show_notification("This mod is already installed.", "info", "Mods")
-                return
-            closed = False
-            reviewed_plans = {frozenset(): plan}
-            manual_preflight_failed = False
 
-            def close(e) -> None:
-                nonlocal closed
-                closed = True
-                self._dialogs().close()
-
-            def manual_ready() -> bool:
-                if manual_preflight_failed:
-                    return False
-                if not any(primary_file(version).get("manual_required") for version in review.plan.versions):
-                    return True
-                ready = getattr(self.client, "manual_files_ready", None)
-                return ready(review.plan) if callable(ready) else True
-
-            async def select_manual_files(e) -> None:
-                nonlocal manual_preflight_failed
-                if closed or review.checking:
-                    return
-                review.checking = True
-                install_button.disabled = True
-                review.render()
-                review.update()
-                install_button.update()
-                try:
-                    files = await self.file_picker.pick_files(dialog_title="Select required CurseForge mod downloads",
-                        file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["jar"], allow_multiple=True)
-                    if files and not closed:
-                        paths = [Path(item.path) for item in files if item.path]
-                        if len(paths) != len(files):
-                            raise ValueError("Selecting manual downloads requires the desktop launcher.")
-                        await asyncio.to_thread(self.client.register_manual_files, review.plan, paths)
-                        # Selected files reveal native requirements that were
-                        # unavailable online. Older plans must not bypass them.
-                        manual_preflight_failed = True
-                        reviewed_plans.clear()
-                        roots = tuple(deepcopy(version) for version in review.plan.root_versions)
-                        for version in roots:
-                            version.pop("_metadata_warning", None)
-                            version.pop("_fabric_loader_metadata", None)
-                        updated = await asyncio.to_thread(
-                            manager.plan_install, self.client, hit["project_id"], profile["minecraft_version"], profile["loader"].lower(),
-                            selected_version=roots[0], selected_versions=roots if updates else (),
-                            loader_version=profile.get("loader_version", ""), version_id=profile.get("version_id", ""),
-                            optional_projects=tuple(review.optional_projects),
-                        )
-                        if updated.snapshot != review.plan.snapshot or updated.runtime_snapshot != review.plan.runtime_snapshot:
-                            raise ValueError("The instance changed. Cancel and review this installation again.")
-                        review.plan = updated
-                        reviewed_plans[frozenset(review.optional_projects)] = updated
-                        manual_preflight_failed = False
-                        review.error = ""
-                except Exception as error:
-                    review.error = str(error)
-                finally:
-                    review.checking = False
-                    if not closed:
-                        install_button.disabled = not manual_ready()
-                        review.render()
-                        review.update()
-                        install_button.update()
-
-            async def optional_change(e, project: str) -> None:
-                nonlocal manual_preflight_failed
-                if closed or review.checking:
-                    return
-                previous = review.optional_projects.copy()
-                if e.control.value:
-                    review.optional_projects.add(project)
-                else:
-                    review.optional_projects.discard(project)
-                selection = frozenset(review.optional_projects)
-                if selection in reviewed_plans:
-                    # Every cached plan keeps the original file snapshot; install
-                    # still hashes and validates that snapshot before committing.
-                    review.plan = reviewed_plans[selection]
-                    review.error = ""
-                    review.render()
-                    review.update()
-                    install_button.disabled = not manual_ready()
-                    install_button.update()
-                    return
-                review.checking = True
-                review.error = ""
-                install_button.disabled = True
-                review.render()
-                review.update()
-                install_button.update()
-                check = track_progress(self._progress, "Checking optional dependencies...", priority=80)
-                try:
-                    roots = tuple(deepcopy(version) for version in review.plan.root_versions)
-                    for version in roots:
-                        version.pop("_metadata_warning", None)
-                        version.pop("_fabric_loader_metadata", None)
-                    updated = await asyncio.to_thread(
-                        manager.plan_install, self.client, hit["project_id"], profile["minecraft_version"], profile["loader"].lower(),
-                        selected_version=roots[0],
-                        loader_version=profile.get("loader_version", ""), optional_projects=tuple(review.optional_projects),
-                        version_id=profile.get("version_id", ""),
-                        **({"selected_versions": roots} if updates else {}),
-                    )
-                    if closed:
-                        return
-                    if updated.snapshot != plan.snapshot:
-                        raise ValueError("Installed mods changed. Cancel and review this installation again.")
-                    if updated.runtime_snapshot != plan.runtime_snapshot:
-                        raise ValueError("The profile's Loader or runtime libraries changed. Cancel and review this installation again.")
-                    review.plan = updated
-                    reviewed_plans[selection] = updated
-                    manual_preflight_failed = False
-                except Exception as error:
-                    review.optional_projects = previous
-                    review.error = str(error)
-                finally:
-                    check.finish()
-                    review.checking = False
-                    if not closed:
-                        install_button.disabled = not manual_ready()
-                        review.render()
-                        review.update()
-                        install_button.update()
-
-            async def install(e) -> None:
-                if closed or review.checking:
-                    return
-                if not manual_ready():
-                    self._show_notification("Select all required CurseForge downloads before installing.", "warning", "Mods")
-                    return
-                close(e)
-                await asyncio.sleep(0.2)
-                current_profile = self.profile or {}
-                if (manager is not self.manager or any(current_profile.get(key) != profile.get(key)
-                        for key in ("id", "loader", "loader_version", "minecraft_version", "version_id"))):
-                    self._show_notification("The profile changed. Review the mod installation again for its current version.", "warning", "Mods")
-                    return
-                with track_progress(self._progress, f"Downloading {hit.get('title', 'mod')}...", priority=100) as download:
-                    await self._run_mutation(
-                        manager, lambda: manager.install(self.client, review.plan, download, can_commit=lambda: not self._is_running()),
-                        f"Updated {len(updates)} {'mod' if len(updates) == 1 else 'mods'}." if updates else f"Installed {hit.get('title', 'mod')}.", activity=download,
-                    )
-
-            review = ModInstallReview(hit, profile, plan, profile_icon=self._profile_icon(profile),
-                                      on_optional_change=optional_change, updates=updates,
-                                      on_manual_files=select_manual_files,
-                                      manual_file_ready=getattr(self.client, "is_manual_file_ready", None))
-            install_button = _button("Update all" if updates else "Install", install, primary=True)
-            install_button.disabled = not manual_ready()
-            self.busy = False
-            self._render()
-            self._update()
-            self._dialogs().show(
-                review, title=review.title,
-                actions=[_button("Cancel", close), install_button],
-                on_cancel=close, width=580, height=review.preferred_height,
-            )
-        except Exception as error:
-            logging.getLogger(__name__).exception("Could not prepare mod installation")
-            self._show_notification(str(error), "error", "Cannot install mod")
-        finally:
-            activity.finish()
-            self.busy = False
-            if not self._dialogs().visible:
-                self._render()
-                self._update()
-
+    def hideEvent(self, event) -> None:
+        self._save_view_state()
+        self._active = False
+        self._invalidate_reads()
+        self.images.set_visible(False)
+        if self._phase == "preparing" and self._progress:
+            self._progress.cancel()
+        if self._review:
+            self._review.reject()
+        self.loading_changed.emit(False)
+        super().hideEvent(event)

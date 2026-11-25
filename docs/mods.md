@@ -5,6 +5,16 @@ The Mods top tab has a content selector for **Mods** and
 Manage Mods button opens the profile from that row. The Mods profile selection is
 independent of the profile selected for Play.
 
+The Qt frontend (`python -m wisc.qt_app`) also provides this workspace, including
+Mods, Modpacks, Shaders, and Texture Packs. It loads saved profiles when the tab
+opens and uses a compact profile dropdown, native virtualized rows, shared
+details/reviews, and a download footer that stays available across navigation.
+Home and Library still use sample profiles in this staged frontend; create or
+edit ordinary instances in the existing launcher, then refresh profiles in Qt.
+See the [Qt Mods preview](screenshots/wisc-qt-mods.png). Local regression checks
+run with `python -B -m unittest temp.test_qt_mods`; that ignored test file is not
+included in a clone.
+
 ## Layout
 
 The custom title bar and top navigation stay visible. The content has the classic

@@ -1,1325 +1,1046 @@
-"""
-Options Dashboard and Settings Subpages for Wisc.
-"""
+"""Qt Settings / Options dashboard and subpages."""
 
-from pathlib import Path
+from __future__ import annotations
+
 import os
-import random
-import sys
 import subprocess
-import flet as ft
-from wisc.ui.controls import LegacySelector, SimpleInput, launcher_button, launcher_back_button
-from wisc.ui.scroll_views import ScrollColumn
-from wisc.ui.glass import glass_panel
-from wisc.ui.settings_art import settings_art
-from wisc.ui.theme_picker import ThemePicker, color_wheel_surface
-from wisc.services import updates as launcher_updates
-from wisc.core.themes import DEFAULT_THEME
-import json
-import threading
-from wisc.core.storage import (
-    DEFAULT_SETTINGS,
-    load_settings,
-    save_settings,
-    save_theme_choice,
-    load_accounts,
-    get_active_account,
-    set_active_account,
-    remove_account,
-    update_offline_username,
+import sys
+import uuid
+from pathlib import Path
+from typing import Callable
+
+from PyQt6.QtCore import QByteArray, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter
+from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtWidgets import (
+    QAbstractButton,
+    QColorDialog,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QScrollArea,
+    QSlider,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from wisc.services import auth as ely_auth
-from wisc.services import skins
-from wisc.ui.components import (
-    rounded_button_style,
-    clickable_mouse_cursor,
-    tooltip,
-    build_themed_switch,
-    create_ambient_gradient_orbs,
-    animate_ambient_gradient_orbs,
-)
-from wisc.core import state
 
 from wisc.core.paths import ASSETS_DIR
-THOUGHTS_FILE = ASSETS_DIR / "thoughts.json"
+from wisc.core.storage import (
+    DATA_DIR,
+    DEFAULT_SETTINGS,
+    add_or_update_account,
+    get_active_account,
+    load_accounts,
+    load_settings,
+    load_theme_choice,
+    remove_account,
+    save_settings,
+    save_theme_choice,
+    set_active_account,
+    update_offline_username,
+)
+from wisc.core.themes import (
+    DEFAULT_CUSTOM_ACCENT,
+    DEFAULT_THEME,
+    get_theme_names,
+    normalize_accent,
+)
+from wisc.ui import theme as theme
+from wisc.ui.components import (
+    ElidedLabel,
+    GlassButton,
+    GlassLineEdit,
+    GlassPanel,
+    LauncherComboBox,
+    paint_glass,
+    paint_switch,
+    text_label,
+)
+from wisc.ui.tasks import ServiceRunner
 
-DEFAULT_THOUGHTS = [
-    "Don't dig straight down in Minecraft or in life; pause, look ahead, and choose a safer next step.",
-    "Every great Minecraft build begins with one block, and every big change begins with one small action.",
-    "Keep exploring: the diamonds you find in a cave are a reminder that hard seasons can still hold hope.",
-    "Place a torch where it's dark, and offer a little kindness where someone needs encouragement.",
-    "Your Minecraft inventory has limits; make room in life for what matters most.",
-    "A world is built one block at a time, and a good life is shaped by small choices made with care.",
-    "It's okay to wander off the map; unexpected paths can lead to your favorite discoveries.",
-]
 
-
-def load_thoughts() -> list[str]:
-    if THOUGHTS_FILE.is_file():
-        try:
-            with open(THOUGHTS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list) and data:
-                    parsed = [str(item).strip() for item in data if str(item).strip()]
-                    if parsed:
-                        return parsed
-        except Exception:
-            pass
-    return DEFAULT_THOUGHTS
-
-
-def get_random_thought() -> str:
-    thoughts = load_thoughts()
-    return random.choice(thoughts) if thoughts else DEFAULT_THOUGHTS[0]
-
-
-def open_system_folder(folder_path: str):
+def _open_folder(path: Path) -> None:
     try:
-        path = Path(folder_path)
         path.mkdir(parents=True, exist_ok=True)
         if hasattr(os, "startfile"):
             os.startfile(str(path))
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(
+                ["open", str(path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         else:
-            subprocess.Popen(["xdg-open", str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(
+                ["xdg-open", str(path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
     except Exception:
         pass
 
 
-def build_options_views(
-    page: ft.Page,
-    theme: dict,
-    settings: dict,
-    persist_setting,
-    navigate,
-    notify,
-    copy_to_clipboard,
-    open_url,
-    theme_dropdown: LegacySelector,
-    available_themes: list[str],
-    maximum_memory_mb: int,
-    minecraft_directory: str,
-    account_picture_preview: ft.Control = None,
-    refresh_account_picture = None,
-    update_sidebar_username = None,
-    refresh_launch_button = None,
-    rebuild_page_callback = None,
-    set_orbs_enabled = None,
-    show_dialog_with_blur = None,
-    close_dialog_with_blur = None,
-    features = None,
-    apply_custom_theme = None,
-) -> dict[str, ft.Control]:
-    selected_theme = state.selected_theme
-    active_page = state.active_page
-    options_background_state = state.options_background_state
-    player_name_state = state.player_name_state
+def _system_memory_mb() -> int:
+    try:
+        import psutil  # type: ignore
 
-
-    def build_option_card(category: dict) -> ft.Container:
-        button = launcher_button("", lambda e: navigate(category["id"]), height=108)
-        button.style.bgcolor = {
-            ft.ControlState.DEFAULT: ft.Colors.TRANSPARENT,
-            ft.ControlState.HOVERED: theme["card_hover"],
-        }
-        button.style.shape = ft.RoundedRectangleBorder(radius=12)
-        button.style.padding = ft.Padding.all(18)
-        button.content = ft.Row(
-            spacing=16,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            controls=[
-                settings_art(category["art"], theme["btn_primary"], width=48, height=48),
-                ft.Column(
-                    expand=True, spacing=5,
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    horizontal_alignment=ft.CrossAxisAlignment.START,
-                    controls=[
-                        ft.Text(category["title"], size=16, weight=ft.FontWeight.W_600,
-                                color=theme["text_primary"]),
-                        ft.Text(category["description"], size=12, color=theme["text_secondary"]),
-                    ],
-                ),
-                ft.Icon(ft.Icons.CHEVRON_RIGHT, size=20, color=theme["text_muted"]),
-            ],
-        )
-        return glass_panel(
-            button, border_radius=12, bgcolor=theme["surface"],
-            col={"xs": 12, "md": 6, "lg": 4},
-        )
-
-    options_categories = [
-        {"id": "options_ui", "title": "Appearance", "art": "appearance",
-         "description": "Your colors, your atmosphere"},
-        {"id": "options_java", "title": "Java & Memory", "art": "java",
-         "description": "Java executable and allocated RAM"},
-        {"id": "options_game", "title": "Game", "art": "game",
-         "description": "Window size, fullscreen and skins"},
-        {"id": "options_accounts", "title": "Accounts", "art": "accounts",
-         "description": "Manage players, sign-ins and skins"},
-        {"id": "options_launcher", "title": "Launcher", "art": "launcher",
-         "description": "Launch behavior, Discord and logs"},
-    ]
-    if features:
-        options_categories.append(
-            {"id": "options_updates", "title": "Updates", "art": "updates",
-             "description": "Check for the latest Wisc release"})
-
-    category_cards = [build_option_card(category) for category in options_categories]
-    dashboard_header = ft.Row(
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        controls=[
-            ft.Column(
-                expand=True, spacing=6,
-                controls=[
-                    ft.Text("Settings", size=24, weight=ft.FontWeight.BOLD, color=theme["text_primary"]),
-                    ft.Text("Make Wisc feel at home.", size=13, color=theme["text_secondary"]),
-                ],
-            ),
-            ft.Container(
-                padding=ft.Padding.symmetric(horizontal=12, vertical=8),
-                border_radius=8, bgcolor=theme["surface"],
-                content=ft.Row([
-                    ft.Container(width=8, height=8, border_radius=4, bgcolor=theme["btn_primary"]),
-                    ft.Text(selected_theme["name"], size=12, color=theme["text_secondary"]),
-                ], spacing=8, tight=True),
-            ),
-        ],
-    )
-    dashboard_footer = glass_panel(
-        bgcolor=theme["surface"], border_radius=12,
-        padding=ft.Padding.symmetric(horizontal=18, vertical=12),
-        content=ft.ResponsiveRow(
-            spacing=12, run_spacing=10,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            controls=[
-                ft.Column([
-                    ft.Text("Wisc", size=16, font_family="Pixelify Sans", color=theme["text_primary"]),
-                    ft.Text("A little help for your next adventure.", size=12, color=theme["text_secondary"]),
-                ], spacing=4, col={"xs": 12, "md": 6}),
-                ft.Row([
-                    launcher_button("About Wisc", lambda e: navigate("options_about"), icon=ft.Icons.INFO_OUTLINE),
-                    launcher_button("Replay welcome tour", lambda e: navigate("onboarding"),
-                                    icon=ft.Icons.AUTO_AWESOME_OUTLINED),
-                ], spacing=8, wrap=True, alignment=ft.MainAxisAlignment.END, col={"xs": 12, "md": 6}),
-            ],
-        ),
-    )
-    dashboard_hero = glass_panel(
-        bgcolor=theme["surface"], border_radius=12,
-        padding=ft.Padding.symmetric(horizontal=24, vertical=18),
-        content=ft.Row([
-            ft.Column([
-                ft.Text("Color studio", size=24, weight=ft.FontWeight.W_600,
-                        color=theme["text_primary"]),
-                ft.Text("Dial in your own accent with a color wheel and live preview.",
-                        size=13, color=theme["text_secondary"]),
-                launcher_button("Customize your colors", lambda e: navigate("options_ui"),
-                                primary=True, height=36),
-            ], expand=True, spacing=10),
-            ft.Container(
-                content=color_wheel_surface(116), width=116, height=116,
-                ignore_interactions=True, opacity=0.9,
-            ),
-        ], spacing=24, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-    )
-    options_orb1, options_orb2 = create_ambient_gradient_orbs(theme, settings.get("enable_orbs", True))
-    options_dashboard = ft.Stack(
-        expand=True, clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-        data={"reveal_controls": [dashboard_header, dashboard_hero, *category_cards, dashboard_footer]},
-        controls=[
-            options_orb1, options_orb2,
-            ft.Container(
-                expand=True, padding=ft.Padding.symmetric(horizontal=28, vertical=20),
-                content=ScrollColumn(
-                    expand=True, spacing=20, scroll=ft.ScrollMode.AUTO,
-                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                    controls=[
-                        dashboard_header,
-                        dashboard_hero,
-                        ft.ResponsiveRow(category_cards, spacing=12, run_spacing=12),
-                        dashboard_footer,
-                    ],
-                ),
-            ),
-        ],
-    )
-
-    async def animate_options_background():
-        if options_background_state["animation_running"]:
-            return
-        options_background_state["animation_running"] = True
+        total = int(psutil.virtual_memory().total // (1024 * 1024))
+        if total >= 1024:
+            return total
+    except Exception:
+        pass
+    if sys.platform == "win32":
         try:
-            await animate_ambient_gradient_orbs(
-                options_orb1,
-                options_orb2,
-                lambda: active_page.get("name") == "options",
-                lambda: settings.get("enable_orbs", True),
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemStatus()
+            stat.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return max(2048, int(stat.ullTotalPhys // (1024 * 1024)))
+        except Exception:
+            pass
+    return 16384
+
+
+def _minecraft_dir() -> Path:
+    import minecraft_launcher_lib
+
+    return Path(minecraft_launcher_lib.utils.get_minecraft_directory())
+
+
+class SettingsArt(QWidget):
+    """Vector illustration from .assets/settings/<name>.svg tinted with the active accent."""
+
+    def __init__(self, name: str, accent: str, size: int = 56, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._name = name
+        self._accent = normalize_accent(accent) or theme.DEFAULT_ACCENT
+        self._renderer: QSvgRenderer | None = None
+        self.setFixedSize(size, size)
+        self._reload()
+
+    def set_accent(self, accent: str) -> None:
+        normalized = normalize_accent(accent) or theme.DEFAULT_ACCENT
+        if normalized != self._accent:
+            self._accent = normalized
+            self._reload()
+            self.update()
+
+    def _reload(self) -> None:
+        svg_path = ASSETS_DIR / "settings" / f"{self._name}.svg"
+        if not svg_path.is_file():
+            self._renderer = None
+            return
+        raw = svg_path.read_text(encoding="utf-8").replace("#46BA34", self._accent)
+        self._renderer = QSvgRenderer(QByteArray(raw.encode("utf-8")), self)
+
+    def paintEvent(self, event) -> None:
+        if self._renderer is None or not self._renderer.isValid():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._renderer.render(painter, QRectF(self.rect()))
+
+
+class GlassSwitch(QAbstractButton):
+    """Borderless pill switch with optional label, matching ModList switches."""
+
+    def __init__(self, label: str = "", checked: bool = False, accent: str = theme.DEFAULT_ACCENT,
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setChecked(checked)
+        self._accent = accent
+        self.setText(label)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(32)
+        self._track_width = 44
+        self._track_height = 24
+
+    def set_accent(self, accent: str) -> None:
+        self._accent = accent
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        if not self.text():
+            return QSize(self._track_width, self._track_height + 6)
+        fm = self.fontMetrics()
+        return QSize(self._track_width + 12 + fm.horizontalAdvance(self.text()), 32)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cy = (self.height() - self._track_height) / 2.0
+        track = QRectF(0, cy, self._track_width, self._track_height)
+        paint_switch(painter, track, self.isChecked(), QColor(self._accent), enabled=self.isEnabled())
+        if self.text():
+            painter.setPen(QColor(theme.TEXT if self.isEnabled() else theme.DISABLED_TEXT))
+            painter.setFont(theme.ui_font(theme.FONT_BODY))
+            text_rect = QRectF(self._track_width + 12, 0, self.width() - self._track_width - 12, self.height())
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+
+
+class OptionCard(QAbstractButton):
+    """Clickable frosted category card on the Settings dashboard."""
+
+    def __init__(self, category_id: str, title: str, description: str, art_name: str,
+                 accent: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.category_id = category_id
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(112)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(14)
+
+        self.art = SettingsArt(art_name, accent, size=48, parent=self)
+        layout.addWidget(self.art, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(4)
+        text_col.addWidget(text_label(title, theme.FONT_SUBHEADING, bold=True))
+        desc = text_label(description, theme.FONT_DETAIL, muted=True)
+        desc.setWordWrap(True)
+        text_col.addWidget(desc)
+        text_col.addStretch(1)
+        layout.addLayout(text_col, 1)
+
+    def apply_accent(self, accent: str) -> None:
+        self.art.set_accent(accent)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        focused = self.hasFocus() and bool(self.property("keyboardFocus"))
+        interaction = (
+            theme.GLASS_PRESSED_OPACITY if self.isDown()
+            else theme.GLASS_HOVER_OPACITY if self.underMouse()
+            else theme.GLASS_FOCUS_OPACITY if focused else 0.0
+        )
+        paint_glass(
+            self,
+            painter,
+            radius=theme.RADIUS_CARD,
+            opacity=min(1.0, theme.GLASS_OPACITY + interaction),
+        )
+
+
+def _setting_row(
+    title: str,
+    description: str,
+    control: QWidget | None = None,
+    extra: QWidget | None = None,
+) -> GlassPanel:
+    panel = GlassPanel(radius=theme.RADIUS_CARD)
+    outer = QVBoxLayout(panel)
+    outer.setContentsMargins(18, 14, 18, 14)
+    outer.setSpacing(12)
+
+    top = QHBoxLayout()
+    top.setSpacing(16)
+
+    info = QVBoxLayout()
+    info.setSpacing(3)
+    info.addWidget(text_label(title, theme.FONT_ROW_TITLE, bold=True))
+    desc = text_label(description, theme.FONT_DETAIL, muted=True)
+    desc.setWordWrap(True)
+    info.addWidget(desc)
+    top.addLayout(info, 1)
+
+    if control is not None:
+        top.addWidget(control, 0, Qt.AlignmentFlag.AlignVCenter)
+    outer.addLayout(top)
+
+    if extra is not None:
+        outer.addWidget(extra)
+    return panel
+
+
+def _make_scroll_area() -> tuple[QScrollArea, QVBoxLayout]:
+    scroll = QScrollArea()
+    scroll.setObjectName("optionsScroll")
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.viewport().setAutoFillBackground(False)
+
+    body = QWidget()
+    body.setObjectName("optionsContent")
+    layout = QVBoxLayout(body)
+    layout.setContentsMargins(0, 0, 8, 12)
+    layout.setSpacing(12)
+    scroll.setWidget(body)
+    return scroll, layout
+
+
+class OptionsPage(QWidget):
+    """Settings dashboard and subpages for the PyQt6 launcher."""
+
+    theme_requested = pyqtSignal(str)
+    settings_changed = pyqtSignal(dict)
+
+    def __init__(self, runner: ServiceRunner, colors: dict[str, str], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.runner = runner
+        self._colors = colors
+        self._settings = load_settings()
+        self._max_ram = _system_memory_mb()
+        self._cards: list[OptionCard] = []
+        self._switches: list[GlassSwitch] = []
+        self._theme_dot: QWidget | None = None
+        self._theme_badge_label: QLabel | None = None
+        self._update_check_token: int | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(*theme.PAGE_MARGINS)
+        root.setSpacing(theme.PAGE_SPACING)
+
+        self.stack = QStackedWidget()
+        root.addWidget(self.stack, 1)
+
+        self._subpages: dict[str, QWidget] = {}
+        self._build_dashboard()
+        self._build_appearance_page()
+        self._build_java_page()
+        self._build_game_page()
+        self._build_accounts_page()
+        self._build_launcher_page()
+        self._build_updates_page()
+        self._build_about_page()
+        self.show_subpage("options")
+
+    def show_subpage(self, key: str) -> None:
+        widget = self._subpages.get(key) or self._subpages["options"]
+        if key == "options_accounts":
+            self._refresh_accounts_list()
+        self.stack.setCurrentWidget(widget)
+
+    def _persist(self, key: str, value: object) -> None:
+        self._settings[key] = value
+        save_settings(self._settings)
+        self.settings_changed.emit(dict(self._settings))
+
+    def _reset_fields(self, keys: tuple[str, ...], refresh_fn: Callable[[], None]) -> None:
+        for key in keys:
+            self._settings[key] = DEFAULT_SETTINGS[key]
+        save_settings(self._settings)
+        refresh_fn()
+        self.settings_changed.emit(dict(self._settings))
+
+    def _build_subpage_shell(
+        self,
+        key: str,
+        title: str,
+        on_reset: Callable[[], None] | None = None,
+    ) -> QVBoxLayout:
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        back = GlassButton("Back")
+        back.setFixedHeight(theme.COMPACT_HEIGHT)
+        back.clicked.connect(lambda: self.show_subpage("options"))
+        header.addWidget(back)
+        header.addWidget(text_label(title, theme.FONT_PAGE_TITLE, bold=True))
+        header.addStretch(1)
+        if on_reset is not None:
+            reset_btn = GlassButton("Reset to defaults")
+            reset_btn.setFixedHeight(theme.COMPACT_HEIGHT)
+            reset_btn.clicked.connect(on_reset)
+            header.addWidget(reset_btn)
+        outer.addLayout(header)
+
+        scroll, content = _make_scroll_area()
+        outer.addWidget(scroll, 1)
+        self._subpages[key] = container
+        self.stack.addWidget(container)
+        return content
+
+    def _build_dashboard(self) -> None:
+        scroll, content = _make_scroll_area()
+        self._subpages["options"] = scroll
+        self.stack.addWidget(scroll)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(4)
+        title_col.addWidget(text_label("Settings", theme.FONT_PAGE_TITLE, bold=True))
+        title_col.addWidget(text_label("Make Wisc feel at home.", theme.FONT_BODY, muted=True))
+        header.addLayout(title_col, 1)
+
+        badge = GlassPanel(radius=theme.RADIUS_BUTTON)
+        badge_row = QHBoxLayout(badge)
+        badge_row.setContentsMargins(12, 8, 12, 8)
+        badge_row.setSpacing(8)
+        self._theme_dot = QWidget()
+        self._theme_dot.setFixedSize(8, 8)
+        self._update_theme_dot()
+        badge_row.addWidget(self._theme_dot)
+        current_theme = load_theme_choice(get_theme_names())
+        self._theme_badge_label = text_label(current_theme, theme.FONT_DETAIL, muted=True)
+        badge_row.addWidget(self._theme_badge_label)
+        header.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        content.addLayout(header)
+
+        hero = GlassPanel(radius=theme.RADIUS_CARD)
+        hero_row = QHBoxLayout(hero)
+        hero_row.setContentsMargins(22, 18, 22, 18)
+        hero_row.setSpacing(18)
+        hero_col = QVBoxLayout()
+        hero_col.setSpacing(8)
+        hero_col.addWidget(text_label("Color studio", theme.FONT_DIALOG_TITLE, bold=True))
+        hero_col.addWidget(
+            text_label("Dial in your own accent and switch Minecraft palettes anytime.", theme.FONT_BODY, muted=True)
+        )
+        customize_btn = GlassButton("Customize your colors", accented=True)
+        customize_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        customize_btn.clicked.connect(lambda: self.show_subpage("options_ui"))
+        hero_col.addWidget(customize_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        hero_row.addLayout(hero_col, 1)
+        hero_art = SettingsArt("appearance", self._colors["btn_primary"], size=68, parent=hero)
+        self._hero_art = hero_art
+        hero_row.addWidget(hero_art, 0, Qt.AlignmentFlag.AlignVCenter)
+        content.addWidget(hero)
+
+        categories = [
+            ("options_ui", "Appearance", "Your colors, your atmosphere", "appearance"),
+            ("options_java", "Java & Memory", "Java executable and allocated RAM", "java"),
+            ("options_game", "Game", "Window size, fullscreen and skins", "game"),
+            ("options_accounts", "Accounts", "Manage players, sign-ins and skins", "accounts"),
+            ("options_launcher", "Launcher", "Launch behavior, Discord and logs", "launcher"),
+            ("options_updates", "Updates", "Check for the latest Wisc release", "updates"),
+        ]
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        for index, (cat_id, title, desc, art) in enumerate(categories):
+            card = OptionCard(cat_id, title, desc, art, self._colors["btn_primary"])
+            card.clicked.connect(lambda checked=False, target=cat_id: self.show_subpage(target))
+            self._cards.append(card)
+            grid.addWidget(card, index // 3, index % 3)
+        for col in range(3):
+            grid.setColumnStretch(col, 1)
+        content.addLayout(grid)
+
+        footer = GlassPanel(radius=theme.RADIUS_CARD)
+        footer_row = QHBoxLayout(footer)
+        footer_row.setContentsMargins(18, 12, 18, 12)
+        footer_row.setSpacing(12)
+        brand_col = QVBoxLayout()
+        brand_col.setSpacing(2)
+        brand = text_label("Wisc", theme.FONT_SUBHEADING, pixel=True)
+        brand_col.addWidget(brand)
+        brand_col.addWidget(text_label("A little help for your next adventure.", theme.FONT_DETAIL, muted=True))
+        footer_row.addLayout(brand_col, 1)
+        about_btn = GlassButton("About Wisc")
+        about_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        about_btn.clicked.connect(lambda: self.show_subpage("options_about"))
+        footer_row.addWidget(about_btn)
+        content.addWidget(footer)
+        content.addStretch(1)
+
+    def _update_theme_dot(self) -> None:
+        if self._theme_dot is not None:
+            self._theme_dot.setStyleSheet(
+                f"background: {self._colors['btn_primary']}; border-radius: 4px;"
             )
-        finally:
-            options_background_state["animation_running"] = False
 
-    options_background_state["animate"] = animate_options_background
+    # ── Appearance ──────────────────────────────────────────────────────────
+    def _build_appearance_page(self) -> None:
+        content = self._build_subpage_shell("options_ui", "Appearance", self._reset_appearance)
 
-    def build_setting_container(
-        title: str,
-        explanation: str,
-        control: ft.Control | None = None,
-        extra_content: ft.Control | None = None,
-    ) -> ft.Container:
-        description = ft.Column(
-            spacing=6,
-            horizontal_alignment=ft.CrossAxisAlignment.START,
-            controls=[
-                ft.Text(title, size=15, weight=ft.FontWeight.W_600, color=theme["text_primary"]),
-                ft.Text(explanation, size=12, color=theme["text_secondary"]),
-            ],
-        )
-        items: list[ft.Control] = [description]
-        if isinstance(control, ft.Switch):
-            description.expand = True
-            items = [ft.Row([description, control], spacing=24,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER)]
-        elif control is not None:
-            items.append(ft.Container(content=control, padding=ft.Padding.only(top=8)))
-        if extra_content is not None:
-            items.append(ft.Container(content=extra_content, padding=ft.Padding.only(top=6)))
-        return glass_panel(
-            bgcolor=theme["surface"], border_radius=12,
-            padding=ft.Padding.symmetric(horizontal=20, vertical=18),
-            content=ft.Column(spacing=8, horizontal_alignment=ft.CrossAxisAlignment.STRETCH, controls=items),
-        )
-
-    def build_settings_page(
-        title: str,
-        setting_items: list[ft.Container],
-        on_reset=None,
-    ) -> ft.Container:
-        subtitles = {
-            "Appearance": "Your palette and background effects.",
-            "Java & Memory": "Give Minecraft the resources it needs.",
-            "Game": "Set up your next Minecraft session.",
-            "Launcher": "Choose how Wisc works around your game.",
-            "About": "The launcher, its creator and your game files.",
-            "Updates": "Keep Wisc up to date.",
-        }
-        header_art = {"Appearance": "appearance", "Java & Memory": "java", "Game": "game",
-                      "Launcher": "launcher", "Updates": "updates"}.get(title)
-        header = ft.Row(
-            spacing=16, vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            controls=[
-                launcher_back_button(lambda e: navigate("options"), label="Settings", tooltip="Back to Settings"),
-                ft.Column(
-                    expand=True, spacing=4,
-                    controls=[
-                        ft.Text(title, size=24, weight=ft.FontWeight.BOLD, color=theme["text_primary"]),
-                        ft.Text(subtitles.get(title, ""), size=12, color=theme["text_secondary"]),
-                    ],
-                ),
-                *([settings_art(header_art, theme["btn_primary"], width=58, height=50)] if header_art else []),
-                *([launcher_button("Reset defaults", on_reset, icon=ft.Icons.RESTORE)] if on_reset else []),
-            ],
-        )
-        return ft.Container(
-            expand=True, padding=ft.Padding.symmetric(horizontal=28, vertical=20),
-            data={"reveal_controls": [header, *setting_items]},
-            content=ft.Column(
-                expand=True, spacing=20, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                controls=[
-                    header,
-                    ScrollColumn(
-                        setting_items, expand=True, spacing=12, scroll=ft.ScrollMode.AUTO,
-                        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                    ),
-                ],
-            ),
-        )
-
-    theme_palette_preview = ft.Row(
-        spacing=8,
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        controls=[
-            ft.Container(
-                width=28,
-                height=28,
-                border_radius=6,
-                bgcolor=theme["btn_primary"],
-                border=ft.Border.all(1, theme["border"]),
-                tooltip="Accent",
-            ),
-            ft.Container(
-                width=28,
-                height=28,
-                border_radius=6,
-                bgcolor=theme["card"],
-                border=ft.Border.all(1, theme["border"]),
-                tooltip="Card",
-            ),
-            ft.Container(
-                width=28,
-                height=28,
-                border_radius=6,
-                bgcolor=theme["surface"],
-                border=ft.Border.all(1, theme["border"]),
-                tooltip="Surface",
-            ),
-            ft.Container(
-                width=28,
-                height=28,
-                border_radius=6,
-                bgcolor=theme["bg"],
-                border=ft.Border.all(1, theme["border"]),
-                tooltip="Background",
-            ),
-            ft.Text(
-                f"{selected_theme['name']} · {theme['btn_primary'].upper()}",
-                size=11,
-                color=theme["text_muted"],
-            ),
-        ],
-    )
-
-    def rebuild_settings_page(message):
-        rebuild_page_callback(selected_theme["name"], active_page["name"])
-        notify(message, ft.Icons.RESTORE)
-
-    def reset_settings_fields(field_names, section_name):
-        current = load_settings()
-        for field_name in field_names:
-            current[field_name] = DEFAULT_SETTINGS[field_name]
-        if not save_settings(current):
-            notify("Could not restore settings.", "error")
-            return
-        settings.update(current)
-        rebuild_settings_page(f"{section_name} settings restored to defaults.")
-
-    def reset_ui_settings(e):
-        if features and features.busy:
-            notify("Wait for the current operation before changing themes.", "warning")
-            return
-        default_theme = (
-            DEFAULT_THEME
-            if DEFAULT_THEME in available_themes
-            else available_themes[0]
-        )
-        current = load_settings()
-        updated = {**current, "enable_orbs": DEFAULT_SETTINGS["enable_orbs"],
-                   "custom_accent": DEFAULT_SETTINGS["custom_accent"]}
-        if not save_settings(updated):
-            notify("Could not save appearance settings.", "error")
-            return
-        if not save_theme_choice(default_theme):
-            save_settings(current)
-            notify("Could not save the selected theme.", "error")
-            return
-        settings.update(updated)
-        selected_theme["name"] = default_theme
-        rebuild_page_callback(default_theme, active_page["name"])
-        notify("UI settings restored to defaults.", ft.Icons.RESTORE)
-
-    ui_subpage = build_settings_page(
-        "Appearance",
-        [
-            *([build_setting_container(
-                "Custom color",
-                "Choose an accent for buttons, selections and focus. Preview it below, then apply.",
-                extra_content=ThemePicker(settings.get("custom_accent", theme["btn_primary"]),
-                                          theme, apply_custom_theme),
-            )] if apply_custom_theme else []),
-            build_setting_container(
+        self._theme_combo = LauncherComboBox()
+        self._theme_combo.setMinimumWidth(220)
+        for name in get_theme_names():
+            self._theme_combo.addItem(name, name)
+        current_theme = load_theme_choice(get_theme_names())
+        idx = self._theme_combo.findData(current_theme)
+        if idx >= 0:
+            self._theme_combo.setCurrentIndex(idx)
+        self._theme_combo.currentIndexChanged.connect(self._on_theme_selected)
+        content.addWidget(
+            _setting_row(
                 "Minecraft palettes",
                 "Start with a favorite palette, or return to your saved Custom color.",
-                control=theme_dropdown,
-                extra_content=theme_palette_preview,
-            ),
-            build_setting_container(
+                control=self._theme_combo,
+            )
+        )
+
+        custom_row = QWidget()
+        custom_layout = QHBoxLayout(custom_row)
+        custom_layout.setContentsMargins(0, 0, 0, 0)
+        custom_layout.setSpacing(8)
+        self._accent_input = GlassLineEdit()
+        self._accent_input.setFixedWidth(120)
+        self._accent_input.setText(str(self._settings.get("custom_accent", DEFAULT_CUSTOM_ACCENT)))
+        pick_btn = GlassButton("Pick color")
+        pick_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        pick_btn.clicked.connect(self._pick_custom_color)
+        apply_btn = GlassButton("Apply", accented=True)
+        apply_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        apply_btn.clicked.connect(self._apply_custom_accent)
+        custom_layout.addWidget(self._accent_input)
+        custom_layout.addWidget(pick_btn)
+        custom_layout.addWidget(apply_btn)
+        content.addWidget(
+            _setting_row(
+                "Custom color",
+                "Choose a hex accent for buttons, selections, and focus.",
+                control=custom_row,
+            )
+        )
+
+        self._orbs_switch = GlassSwitch(
+            "Enable background orbs",
+            bool(self._settings.get("enable_orbs", True)),
+            self._colors["btn_primary"],
+        )
+        self._orbs_switch.toggled.connect(lambda v: self._persist("enable_orbs", v))
+        self._switches.append(self._orbs_switch)
+        content.addWidget(
+            _setting_row(
                 "Ambient Background Orbs",
                 "Display subtle animated gradient orbs in the background of screens.",
-                control=build_themed_switch(
-                    label="Enable background orbs",
-                    value=settings.get("enable_orbs", True),
-                    theme=theme,
-                    on_change=lambda e: set_orbs_enabled(e.control.value),
-                ),
-            ),
-        ],
-        on_reset=reset_ui_settings,
-    )
+                control=self._orbs_switch,
+            )
+        )
+        content.addStretch(1)
 
-    ram_input_ref = {}
-
-    def set_ram_value(value):
-        value = min(maximum_memory_mb, max(256, int(value)))
-        persist_setting("ram_mb", value)
-        field = ram_input_ref.get("control")
-        if field is not None and field.value != str(value):
-            field.value = str(value)
-            field.update()
-
-    def on_ram_slider_change(e):
-        set_ram_value(round(e.control.value))
-
-    def on_ram_input_change(e):
-        try:
-            value = int(e.control.value)
-        except (TypeError, ValueError):
+    def _on_theme_selected(self) -> None:
+        name = self._theme_combo.currentData()
+        if not isinstance(name, str) or not name:
             return
-        if 256 <= value <= maximum_memory_mb:
-            persist_setting("ram_mb", value)
-            ram_slider.value = value
-            ram_slider.update()
+        save_theme_choice(name)
+        if self._theme_badge_label is not None:
+            self._theme_badge_label.setText(name)
+        self.theme_requested.emit(name)
 
-    def on_ram_input_blur(e):
-        try:
-            value = int(e.control.value)
-        except (TypeError, ValueError):
-            value = int(settings["ram_mb"])
-        set_ram_value(value)
+    def _pick_custom_color(self) -> None:
+        initial = QColor(normalize_accent(self._accent_input.text()) or self._colors["btn_primary"])
+        chosen = QColorDialog.getColor(initial, self, "Choose Custom Accent")
+        if chosen.isValid():
+            self._accent_input.setText(chosen.name().upper())
+            self._apply_custom_accent()
 
-    ram_slider = ft.Slider(
-        min=256,
-        max=max(512, maximum_memory_mb),
-        divisions=max(1, (max(512, maximum_memory_mb) - 256) // 256),
-        value=settings["ram_mb"],
-        active_color=theme["btn_primary"],
-        inactive_color=theme["border"],
-        expand=True,
-        on_change=on_ram_slider_change,
-    )
-    ram_input = SimpleInput(
-        hint_text="RAM",
-        value=str(settings["ram_mb"]),
-        width=132,
-        suffix=ft.Text("MB", color=theme["text_secondary"]),
-        keyboard_type=ft.KeyboardType.NUMBER,
-        border_color=theme["border"],
-        focused_border_color=theme["btn_primary"],
-        color=theme["text_primary"],
-        fill_color=theme["card"],
-        border_radius=5,
-        on_change=on_ram_input_change,
-        on_blur=on_ram_input_blur,
-    )
-    ram_input_ref["control"] = ram_input
+    def _apply_custom_accent(self) -> None:
+        normalized = normalize_accent(self._accent_input.text())
+        if not normalized:
+            return
+        self._accent_input.setText(normalized)
+        self._persist("custom_accent", normalized)
+        save_theme_choice("Custom")
+        idx = self._theme_combo.findData("Custom")
+        if idx >= 0:
+            self._theme_combo.blockSignals(True)
+            self._theme_combo.setCurrentIndex(idx)
+            self._theme_combo.blockSignals(False)
+        if self._theme_badge_label is not None:
+            self._theme_badge_label.setText("Custom")
+        self.theme_requested.emit("Custom")
 
-    def on_java_path_change(e):
-        persist_setting("java_path", e.control.value or "")
+    def _reset_appearance(self) -> None:
+        self._persist("enable_orbs", DEFAULT_SETTINGS["enable_orbs"])
+        self._persist("custom_accent", DEFAULT_SETTINGS["custom_accent"])
+        self._orbs_switch.setChecked(bool(DEFAULT_SETTINGS["enable_orbs"]))
+        self._accent_input.setText(str(DEFAULT_SETTINGS["custom_accent"]))
+        save_theme_choice(DEFAULT_THEME)
+        idx = self._theme_combo.findData(DEFAULT_THEME)
+        if idx >= 0:
+            self._theme_combo.setCurrentIndex(idx)
 
-    def on_positive_integer_change(setting_key):
-        def handler(e):
-            try:
-                value = int(e.control.value)
-            except (TypeError, ValueError):
-                return
-            if value > 0:
-                persist_setting(setting_key, value)
+    # ── Java & Memory ───────────────────────────────────────────────────────
+    def _build_java_page(self) -> None:
+        content = self._build_subpage_shell(
+            "options_java",
+            "Java & Memory",
+            lambda: self._reset_fields(("ram_mb", "java_path"), self._sync_java_fields),
+        )
 
-        return handler
+        ram_row = QWidget()
+        ram_layout = QHBoxLayout(ram_row)
+        ram_layout.setContentsMargins(0, 0, 0, 0)
+        ram_layout.setSpacing(12)
+        self._ram_slider = QSlider(Qt.Orientation.Horizontal)
+        self._ram_slider.setMinimum(256)
+        self._ram_slider.setMaximum(self._max_ram)
+        self._ram_slider.setSingleStep(256)
+        self._ram_slider.setPageStep(512)
+        self._ram_slider.setFixedWidth(220)
+        self._ram_input = GlassLineEdit()
+        self._ram_input.setFixedWidth(96)
+        self._ram_slider.valueChanged.connect(self._on_ram_slider_changed)
+        self._ram_input.editingFinished.connect(self._on_ram_input_committed)
+        ram_layout.addWidget(self._ram_slider)
+        ram_layout.addWidget(self._ram_input)
+        ram_layout.addWidget(text_label("MB", theme.FONT_DETAIL, muted=True))
 
-    java_subpage = build_settings_page(
-        "Java & Memory",
-        [
-            build_setting_container(
+        content.addWidget(
+            _setting_row(
                 "Allocated Memory (RAM)",
-                f"Allocate between 256 MB and {maximum_memory_mb:,} MB of detected system memory.",
-                control=ft.Row(
-                    spacing=16,
-                    controls=[
-                        ram_slider,
-                        ram_input,
-                    ],
-                ),
-            ),
-            build_setting_container(
-                "Java Executable",
-                "Leave empty to use system Java, or enter the path to your Java executable.",
-                control=SimpleInput(
-                    hint_text="e.g. C:\\Program Files\\Java\\jdk-21\\bin\\java.exe",
-                    border_color=theme["border"],
-                    focused_border_color=theme["btn_primary"],
-                    color=theme["text_primary"],
-                    fill_color=theme["card"],
-                    border_radius=5,
-                    expand=True,
-                    value=settings["java_path"],
-                    on_change=on_java_path_change,
-                ),
-            ),
-        ],
-        on_reset=lambda e: reset_settings_fields(
-            ("ram_mb", "java_path"), "Java"
-        ),
-    )
+                f"Allocate between 256 MB and {self._max_ram:,} MB of detected system memory.",
+                control=ram_row,
+            )
+        )
 
-    game_subpage = build_settings_page(
-        "Game",
-        [
-            build_setting_container(
+        java_row = QWidget()
+        java_layout = QHBoxLayout(java_row)
+        java_layout.setContentsMargins(0, 0, 0, 0)
+        java_layout.setSpacing(8)
+        self._java_input = GlassLineEdit()
+        self._java_input.setMinimumWidth(260)
+        self._java_input.setPlaceholderText("System Java (automatic)")
+        self._java_input.textChanged.connect(lambda text: self._persist("java_path", text.strip()))
+        browse_btn = GlassButton("Browse")
+        browse_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        browse_btn.clicked.connect(self._browse_java)
+        java_layout.addWidget(self._java_input, 1)
+        java_layout.addWidget(browse_btn)
+
+        content.addWidget(
+            _setting_row(
+                "Java Executable",
+                "Leave empty to use system Java, or select your java.exe.",
+                control=java_row,
+            )
+        )
+        content.addStretch(1)
+        self._sync_java_fields()
+
+    def _sync_java_fields(self) -> None:
+        ram = int(self._settings.get("ram_mb", DEFAULT_SETTINGS["ram_mb"]))
+        ram = min(self._max_ram, max(256, ram))
+        self._ram_slider.blockSignals(True)
+        self._ram_slider.setValue(ram)
+        self._ram_slider.blockSignals(False)
+        self._ram_input.setText(str(ram))
+        self._java_input.blockSignals(True)
+        self._java_input.setText(str(self._settings.get("java_path", "")))
+        self._java_input.blockSignals(False)
+
+    def _on_ram_slider_changed(self, value: int) -> None:
+        snapped = max(256, min(self._max_ram, round(value / 128) * 128))
+        self._ram_input.setText(str(snapped))
+        self._persist("ram_mb", snapped)
+
+    def _on_ram_input_committed(self) -> None:
+        try:
+            value = int(self._ram_input.text().strip())
+        except ValueError:
+            self._sync_java_fields()
+            return
+        clamped = max(256, min(self._max_ram, value))
+        self._ram_input.setText(str(clamped))
+        self._ram_slider.blockSignals(True)
+        self._ram_slider.setValue(clamped)
+        self._ram_slider.blockSignals(False)
+        self._persist("ram_mb", clamped)
+
+    def _browse_java(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Java Executable",
+            str(Path(self._java_input.text()).parent) if self._java_input.text() else "",
+            "Java Executable (java.exe javaw.exe);;All Files (*)",
+        )
+        if path:
+            self._java_input.setText(path)
+
+    # ── Game ────────────────────────────────────────────────────────────────
+    def _build_game_page(self) -> None:
+        content = self._build_subpage_shell(
+            "options_game",
+            "Game",
+            lambda: self._reset_fields(
+                ("window_width", "window_height", "fullscreen", "enable_custom_skins"),
+                self._sync_game_fields,
+            ),
+        )
+
+        res_row = QWidget()
+        res_layout = QHBoxLayout(res_row)
+        res_layout.setContentsMargins(0, 0, 0, 0)
+        res_layout.setSpacing(8)
+        self._width_input = GlassLineEdit()
+        self._width_input.setFixedWidth(90)
+        self._width_input.editingFinished.connect(
+            lambda: self._commit_positive_int(self._width_input, "window_width")
+        )
+        self._height_input = GlassLineEdit()
+        self._height_input.setFixedWidth(90)
+        self._height_input.editingFinished.connect(
+            lambda: self._commit_positive_int(self._height_input, "window_height")
+        )
+        res_layout.addWidget(text_label("W:", theme.FONT_DETAIL, muted=True))
+        res_layout.addWidget(self._width_input)
+        res_layout.addWidget(text_label("H:", theme.FONT_DETAIL, muted=True))
+        res_layout.addWidget(self._height_input)
+        content.addWidget(
+            _setting_row(
                 "Default Window Resolution",
                 "The window resolution applied when Minecraft starts up.",
-                control=ft.Row(
-                    spacing=12,
-                    controls=[
-                        SimpleInput(
-                            hint_text="Pixels",
-                            keyboard_type=ft.KeyboardType.NUMBER,
-                            value=str(settings["window_width"]),
-                            width=110,
-                            prefix=ft.Text("W: ", color=theme["text_secondary"]),
-                            border_color=theme["border"],
-                            focused_border_color=theme["btn_primary"],
-                            color=theme["text_primary"],
-                            fill_color=theme["card"],
-                            border_radius=5,
-                            on_change=on_positive_integer_change("window_width"),
-                        ),
-                        SimpleInput(
-                            hint_text="Pixels",
-                            keyboard_type=ft.KeyboardType.NUMBER,
-                            value=str(settings["window_height"]),
-                            width=110,
-                            prefix=ft.Text("H: ", color=theme["text_secondary"]),
-                            border_color=theme["border"],
-                            focused_border_color=theme["btn_primary"],
-                            color=theme["text_primary"],
-                            fill_color=theme["card"],
-                            border_radius=5,
-                            on_change=on_positive_integer_change("window_height"),
-                        ),
-                    ],
-                ),
-            ),
-            build_setting_container(
+                control=res_row,
+            )
+        )
+
+        self._fullscreen_switch = GlassSwitch(
+            "Start in fullscreen",
+            bool(self._settings.get("fullscreen", False)),
+            self._colors["btn_primary"],
+        )
+        self._fullscreen_switch.toggled.connect(lambda v: self._persist("fullscreen", v))
+        self._switches.append(self._fullscreen_switch)
+        content.addWidget(
+            _setting_row(
                 "Fullscreen",
                 "Launch Minecraft directly in fullscreen mode.",
-                control=build_themed_switch(
-                    label="Start in fullscreen",
-                    value=settings["fullscreen"],
-                    theme=theme,
-                    on_change=lambda e: persist_setting(
-                        "fullscreen", e.control.value
-                    ),
-                ),
-            ),
-            build_setting_container(
+                control=self._fullscreen_switch,
+            )
+        )
+
+        self._skins_switch = GlassSwitch(
+            "Enable in-game skins and capes",
+            bool(self._settings.get("enable_custom_skins", True)),
+            self._colors["btn_primary"],
+        )
+        self._skins_switch.toggled.connect(lambda v: self._persist("enable_custom_skins", v))
+        self._switches.append(self._skins_switch)
+        content.addWidget(
+            _setting_row(
                 "Custom Skins",
                 "Show Ely.by skins or your offline account's local skin and cape in-game.",
-                control=build_themed_switch(
-                    label="Enable in-game skins and capes",
-                    value=settings.get("enable_custom_skins", True),
-                    theme=theme,
-                    on_change=lambda e: persist_setting(
-                        "enable_custom_skins", e.control.value
-                    ),
-                ),
-            ),
-        ],
-        on_reset=lambda e: reset_settings_fields(
-            ("window_width", "window_height", "fullscreen", "enable_custom_skins"), "Game"
-        ),
-    )
+                control=self._skins_switch,
+            )
+        )
+        content.addStretch(1)
+        self._sync_game_fields()
 
-    def open_custom_dialog(dlg):
-        if callable(show_dialog_with_blur):
-            show_dialog_with_blur(dlg)
+    def _sync_game_fields(self) -> None:
+        self._width_input.setText(str(self._settings.get("window_width", DEFAULT_SETTINGS["window_width"])))
+        self._height_input.setText(str(self._settings.get("window_height", DEFAULT_SETTINGS["window_height"])))
+        self._fullscreen_switch.setChecked(bool(self._settings.get("fullscreen", False)))
+        self._skins_switch.setChecked(bool(self._settings.get("enable_custom_skins", True)))
+
+    def _commit_positive_int(self, field: GlassLineEdit, key: str) -> None:
+        try:
+            value = int(field.text().strip())
+        except ValueError:
+            field.setText(str(self._settings.get(key, DEFAULT_SETTINGS[key])))
+            return
+        if value > 0:
+            self._persist(key, value)
         else:
-            page.show_dialog(dlg)
-            page.update()
+            field.setText(str(self._settings.get(key, DEFAULT_SETTINGS[key])))
 
-    def close_custom_dialog(dlg):
-        if callable(close_dialog_with_blur):
-            close_dialog_with_blur(dlg)
-        else:
-            dlg.open = False
-            try:
-                page.close(dlg)
-            except Exception:
-                pass
-            page.update()
+    # ── Accounts ────────────────────────────────────────────────────────────
+    def _build_accounts_page(self) -> None:
+        content = self._build_subpage_shell("options_accounts", "Accounts")
 
-    def show_ely_login_dialog(account=None):
-        navigate("account_login", account.get("id") if account else None)
-
-    active_account = get_active_account()
-    accounts_data = load_accounts()
-    saved_accounts = accounts_data.get("accounts", [])
-
-    offline_account = active_account if active_account.get("type") == "offline" else None
-    offline_name = (offline_account.get("username") if offline_account else player_name_state["value"]) or "Player"
-
-    if features:
-        features.open_ely_login = show_ely_login_dialog
-
-    def open_edit_offline_name_dialog():
-        edit_name_field = SimpleInput(
-            label="Offline Player Username",
-            value=offline_name,
-            width=320,
-            max_length=16,
-            autofocus=True,
-            hint_text="1-16 letters, numbers, or _",
-            border_color=theme["border"],
-            focused_border_color=theme["btn_primary"],
-            color=theme["text_primary"],
-            label_style=ft.TextStyle(color=theme["text_secondary"], size=13),
-            cursor_color=theme["btn_primary"],
-            fill_color=theme["card"],
-            border_radius=8,
+        add_btn = GlassButton("Add Offline Account", accented=True)
+        add_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        add_btn.clicked.connect(self._add_offline_account)
+        content.addWidget(
+            _setting_row(
+                "Player Accounts",
+                "Switch active accounts, rename offline players, or remove saved accounts.",
+                control=add_btn,
+            )
         )
 
-        name_error_text = ft.Text(
-            "",
-            size=12,
-            color=ft.Colors.RED_400,
-            weight=ft.FontWeight.W_500,
-            visible=False,
-        )
+        self._accounts_box = QVBoxLayout()
+        self._accounts_box.setSpacing(10)
+        content.addLayout(self._accounts_box)
+        content.addStretch(1)
+        self._refresh_accounts_list()
 
-        def on_save_name(e):
-            val = (edit_name_field.value or "").strip()
-            if not val:
-                name_error_text.value = "Username cannot be empty."
-                name_error_text.visible = True
-                edit_dlg.update()
-                return
+    def _refresh_accounts_list(self) -> None:
+        while self._accounts_box.count():
+            item = self._accounts_box.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
-            if not all(char.isascii() and (char.isalnum() or char == "_") for char in val) or len(val) > 16:
-                name_error_text.value = "Use 1-16 letters, numbers, or underscores."
-                name_error_text.visible = True
-                edit_dlg.update()
-                return
-            if not update_offline_username(val):
-                name_error_text.value = "Could not save the username. Try again."
-                name_error_text.visible = True
-                edit_dlg.update()
-                return
-            active_acc = get_active_account()
-            if active_acc.get("type") == "offline":
-                player_name_state["value"] = val
-                if callable(update_sidebar_username):
-                    update_sidebar_username()
-                if callable(refresh_account_picture):
-                    refresh_account_picture()
-                if callable(refresh_launch_button):
-                    refresh_launch_button()
+        accounts_data = load_accounts()
+        accounts = accounts_data.get("accounts", []) if isinstance(accounts_data, dict) else []
+        active = get_active_account()
+        active_id = active.get("id")
+        for account in accounts:
+            acc_id = str(account.get("id", ""))
+            username = str(account.get("username", "Player"))
+            acc_type = "Ely.by" if account.get("type") == "ely" else "Offline"
+            is_active = acc_id == active_id
 
-            close_custom_dialog(edit_dlg)
-            rebuild_settings_page(f"Offline username changed to '{val}'.")
-            notify(f"Updated offline username to '{val}'", ft.Icons.CHECK_CIRCLE)
+            actions = QWidget()
+            row = QHBoxLayout(actions)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            if is_active:
+                active_btn = GlassButton("Active", accented=True)
+                active_btn.setEnabled(False)
+                active_btn.setFixedHeight(theme.COMPACT_HEIGHT)
+                row.addWidget(active_btn)
+            else:
+                use_btn = GlassButton("Use")
+                use_btn.setFixedHeight(theme.COMPACT_HEIGHT)
+                use_btn.clicked.connect(lambda checked=False, aid=acc_id: self._select_account(aid))
+                row.addWidget(use_btn)
 
-        btn_primary_text = theme.get("btn_primary_text", theme["text_primary"])
+            if account.get("type") == "offline":
+                rename_btn = GlassButton("Rename")
+                rename_btn.setFixedHeight(theme.COMPACT_HEIGHT)
+                rename_btn.clicked.connect(
+                    lambda checked=False, aid=acc_id, cur=username: self._rename_offline(aid, cur)
+                )
+                row.addWidget(rename_btn)
 
-        save_btn = ft.Button(
-            "Save",
-            bgcolor=theme["btn_primary"],
-            color=btn_primary_text,
-            style=rounded_button_style,
-            on_click=on_save_name,
-            height=38,
-        )
+            if len(accounts) > 1:
+                remove_btn = GlassButton("Remove")
+                remove_btn.setFixedHeight(theme.COMPACT_HEIGHT)
+                remove_btn.clicked.connect(lambda checked=False, aid=acc_id: self._delete_account(aid))
+                row.addWidget(remove_btn)
 
-        cancel_edit_btn = ft.Button(
-            "Cancel",
-            bgcolor=theme["surface"],
-            color=theme["text_primary"],
-            style=rounded_button_style,
-            on_click=lambda e: close_custom_dialog(edit_dlg),
-            height=38,
-        )
+            self._accounts_box.addWidget(
+                _setting_row(username, f"{acc_type} account", control=actions)
+            )
 
-        edit_actions_row = ft.Row(
-            alignment=ft.MainAxisAlignment.END,
-            spacing=10,
-            controls=[cancel_edit_btn, save_btn],
-        )
+    def _add_offline_account(self) -> None:
+        name, ok = QInputDialog.getText(self, "Add Offline Account", "Player username:")
+        if ok and name.strip():
+            add_or_update_account(
+                {"id": uuid.uuid4().hex, "type": "offline", "username": name.strip()},
+                set_as_active=True,
+            )
+            self._refresh_accounts_list()
 
-        edit_dialog_content = ft.Container(
-            width=340,
-            content=ft.Column(
-                tight=True,
-                spacing=14,
-                controls=[
-                    ft.Text(
-                        "Change your username for playing in offline mode.",
-                        size=12,
-                        color=theme["text_secondary"],
-                    ),
-                    edit_name_field,
-                    name_error_text,
-                    ft.Container(height=4),
-                    edit_actions_row,
-                ],
+    def _select_account(self, account_id: str) -> None:
+        set_active_account(account_id)
+        self._refresh_accounts_list()
+
+    def _rename_offline(self, account_id: str, current: str) -> None:
+        name, ok = QInputDialog.getText(self, "Rename Offline Account", "New username:", text=current)
+        if ok and name.strip():
+            update_offline_username(account_id, name.strip())
+            self._refresh_accounts_list()
+
+    def _delete_account(self, account_id: str) -> None:
+        remove_account(account_id)
+        self._refresh_accounts_list()
+
+    # ── Launcher ────────────────────────────────────────────────────────────
+    def _build_launcher_page(self) -> None:
+        content = self._build_subpage_shell(
+            "options_launcher",
+            "Launcher",
+            lambda: self._reset_fields(
+                ("launch_action", "capture_logs", "discord_rpc"),
+                self._sync_launcher_fields,
             ),
         )
 
-        edit_dlg = ft.AlertDialog(
-            modal=False,
-            bgcolor=theme["card"],
-            shape=ft.RoundedRectangleBorder(radius=14),
-            on_dismiss=lambda e: close_custom_dialog(edit_dlg),
-            title=ft.Row(
-                spacing=10,
-                controls=[
-                    ft.Icon(ft.Icons.EDIT_OUTLINED, color=theme["btn_primary"], size=22),
-                    ft.Text("Edit Offline Username", size=18, weight=ft.FontWeight.BOLD, color=theme["text_primary"]),
-                ],
-            ),
-            content=edit_dialog_content,
+        self._discord_switch = GlassSwitch(
+            "Share activity",
+            bool(self._settings.get("discord_rpc", True)),
+            self._colors["btn_primary"],
+        )
+        self._discord_switch.toggled.connect(lambda v: self._persist("discord_rpc", v))
+        self._switches.append(self._discord_switch)
+        content.addWidget(
+            _setting_row(
+                "Discord Presence",
+                "Show your launcher and Minecraft activity in Discord.",
+                control=self._discord_switch,
+            )
         )
 
-        open_custom_dialog(edit_dlg)
-
-    def make_switch_handler(target_id, target_name):
-        def handler(e):
-            if not set_active_account(target_id):
-                notify("Could not switch accounts.", ft.Icons.ERROR_OUTLINE)
-                return
-            player_name_state["value"] = target_name
-            if callable(update_sidebar_username):
-                update_sidebar_username()
-            if callable(refresh_account_picture):
-                refresh_account_picture()
-            if callable(refresh_launch_button):
-                refresh_launch_button()
-            rebuild_settings_page(f"Switched active account to {target_name}.")
-        return handler
-
-    def make_logout_handler(target_id, target_name):
-        def handler(e):
-            def do_logout():
-                from wisc.core import storage
-                account = next((item for item in storage.load_accounts(include_credentials=True).get('accounts', [])
-                                if item.get('id') == target_id), {})
-                token = account.get('access_token')
-                client = account.get('client_token')
-                if token and client:
-                    try:
-                        ely_auth.invalidate_token(token, client)
-                    except Exception:
-                        pass
-                if not remove_account(target_id):
-                    notify("Could not remove the account.", ft.Icons.ERROR_OUTLINE)
-                    return
-                new_active = get_active_account()
-                player_name_state["value"] = new_active.get("username", "Player")
-                if callable(update_sidebar_username):
-                    update_sidebar_username()
-                if callable(refresh_account_picture):
-                    refresh_account_picture()
-                if callable(refresh_launch_button):
-                    refresh_launch_button()
-                rebuild_settings_page(f"Logged out of {target_name}.")
-            threading.Thread(target=do_logout, daemon=True).start()
-        return handler
-
-    def make_sync_handler(target_name):
-        def handler(e):
-            def do_sync():
-                try:
-                    skins.fetch_ely_skin(target_name, force_refresh=True, timeout=3.0)
-                    if callable(refresh_account_picture):
-                        refresh_account_picture()
-                    notify(f"Synced latest skin from Ely.by for {target_name}!", ft.Icons.CHECK_CIRCLE)
-                except Exception as err:
-                    notify(f"Could not sync skin: {err}", ft.Icons.ERROR_OUTLINE)
-            threading.Thread(target=do_sync, daemon=True).start()
-        return handler
-
-    from wisc.ui.accounts import build_accounts_view
-
-    accounts_subpage = build_accounts_view(
-        theme=theme, accounts=saved_accounts, active_account=active_account,
-        on_add=show_ely_login_dialog, on_login=show_ely_login_dialog,
-        on_switch=lambda account: make_switch_handler(account["id"], account["username"])(None),
-        on_logout=lambda account: make_logout_handler(account["id"], account["username"])(None),
-        on_sync=lambda account: make_sync_handler(account["username"])(None),
-        on_edit_offline=open_edit_offline_name_dialog,
-        on_back=lambda: navigate("options"),
-    )
-
-    launcher_subpage = build_settings_page(
-        "Launcher",
-        [
-            build_setting_container(
-                "Discord Presence", "Show your launcher and Minecraft activity in Discord.",
-                control=build_themed_switch("Share activity", bool(settings.get("discord_rpc", True)), theme=theme,
-                    on_change=lambda e: persist_setting("discord_rpc", e.control.value))),
-            build_setting_container(
+        self._launch_combo = LauncherComboBox()
+        self._launch_combo.setMinimumWidth(220)
+        for key, text in (
+            ("Hide launcher", "Hide launcher (Default)"),
+            ("Keep launcher open", "Keep launcher open"),
+            ("Close launcher", "Close launcher"),
+        ):
+            self._launch_combo.addItem(text, key)
+        self._launch_combo.currentIndexChanged.connect(
+            lambda: self._persist("launch_action", str(self._launch_combo.currentData()))
+        )
+        content.addWidget(
+            _setting_row(
                 "Action on Launch",
                 "Choose what Wisc does when Minecraft starts.",
-                control=LegacySelector(
-                    value=settings["launch_action"],
-                    options=[
-                        ft.DropdownOption(
-                            key="Hide launcher",
-                            text="Hide launcher (Default)",
-                        ),
-                        ft.DropdownOption(
-                            key="Keep launcher open",
-                            text="Keep launcher open",
-                        ),
-                        ft.DropdownOption(
-                            key="Close launcher",
-                            text="Close launcher",
-                        ),
-                    ],
-                    width=260,
-                    border_color=theme["border"],
-                    focused_border_color=theme["btn_primary"],
-                    color=theme["text_primary"],
-                    fill_color=theme["card"],
-                    border_radius=8,
-                    on_select=lambda e: persist_setting(
-                        "launch_action", e.control.value
-                    ),
-                ),
-            ),
-            build_setting_container(
-                "Log Capture",
-                "Capture standard output to log files for crash inspection.",
-                control=build_themed_switch(
-                    label="Record logs to disk",
-                    value=settings["capture_logs"],
-                    theme=theme,
-                    on_change=lambda e: persist_setting(
-                        "capture_logs", e.control.value
-                    ),
-                ),
-            ),
-        ],
-        on_reset=lambda e: reset_settings_fields(
-            ("launch_action", "capture_logs", "discord_rpc"), "Launcher"
-        ),
-    )
-
-    def on_card_hover(e, container, resting_color):
-        is_hovered = e.data == "true"
-        container.bgcolor = theme["card_hover"] if is_hovered else resting_color
-        container.update()
-
-    def mini_badge(text, color=None):
-        return ft.Container(
-            bgcolor=theme["card"],
-            border=ft.Border.all(1, color=theme["border"]),
-            border_radius=6,
-            padding=ft.Padding.symmetric(horizontal=8, vertical=3),
-            content=ft.Text(
-                text,
-                size=11,
-                weight=ft.FontWeight.W_500,
-                color=color or theme["text_secondary"],
-            ),
+                control=self._launch_combo,
+            )
         )
 
-    # 1. Header Card (Minimal branding & vision)
-    about_hero_card = glass_panel(
-        bgcolor=theme["surface"],
-        border=ft.Border.all(1, color=theme["border"]),
-        border_radius=12,
-        padding=ft.Padding.all(20),
-        content=ft.Column(
-            spacing=12,
-            horizontal_alignment=ft.CrossAxisAlignment.START,
-            controls=[
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Row(
-                            spacing=0,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Image(src="icons/wisc_mark.png",
-                                         width=36, height=26, fit=ft.BoxFit.CONTAIN),
-                                ft.Container(width=10),
-                                ft.Text(
-                                    "Wisc",
-                                    font_family="Pixelify Sans",
-                                    size=24,
-                                    weight=ft.FontWeight.BOLD,
-                                    color=theme["text_primary"],
-                                ),
-                                ft.Container(width=8),
-                                ft.Container(content=mini_badge(launcher_updates.version_label(), color=theme["btn_primary"]),
-                                             on_click=lambda e: features and features.updater.show_release_notes(),
-                                             tooltip="What's new"),
-                            ],
-                        ),
-                        mini_badge("Stable", color=theme["btn_primary"]),
-                    ],
-                ),
-                ft.Text(
-                    "Wisc is a Minecraft Java Edition launcher for managing versions, profiles, mods, and skins.",
-                    size=13,
-                    color=theme["text_secondary"],
-                ),
-                ft.Row(
-                    spacing=8,
-                    controls=[
-                        mini_badge("Minimalism"),
-                        mini_badge("Functionality"),
-                        mini_badge("Clean UX"),
-                    ],
-                ),
-            ],
-        ),
-    )
-    about_hero_card.on_hover = lambda e, c=about_hero_card: on_card_hover(e, c, theme["surface"])
+        self._logs_switch = GlassSwitch(
+            "Record logs to disk",
+            bool(self._settings.get("capture_logs", True)),
+            self._colors["btn_primary"],
+        )
+        self._logs_switch.toggled.connect(lambda v: self._persist("capture_logs", v))
+        self._switches.append(self._logs_switch)
+        content.addWidget(
+            _setting_row(
+                "Log Capture",
+                "Capture standard output to log files for crash inspection.",
+                control=self._logs_switch,
+            )
+        )
+        content.addStretch(1)
+        self._sync_launcher_fields()
 
-    # 2. Creator & Links Card (Unified, clean)
-    discord_id_pill_card = glass_panel(
-        bgcolor=theme["card"],
-        border=ft.Border.all(1, color=theme["border"]),
-        border_radius=8,
-        padding=ft.Padding.symmetric(horizontal=10, vertical=6),
-        ink=True,
-        tooltip=tooltip("Click to copy Discord ID (@jaydeeppatil23)"),
-        on_click=lambda e: copy_to_clipboard(
-            "@jaydeeppatil23",
-            "Copied Discord ID to clipboard: @jaydeeppatil23",
-        ),
-        content=ft.Row(
-            spacing=6,
-            tight=True,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            controls=[
-                ft.Icon(
-                    ft.Icons.DISCORD,
-                    size=16,
-                    color=theme["btn_primary"],
-                ),
-                ft.Text(
-                    "@jaydeeppatil23",
-                    size=12,
-                    weight=ft.FontWeight.BOLD,
-                    color=theme["text_primary"],
-                ),
-                ft.Icon(
-                    ft.Icons.CONTENT_COPY_ROUNDED,
-                    size=13,
-                    color=theme["text_muted"],
-                ),
-            ],
-        ),
-    )
-    discord_id_pill_card.on_hover = lambda e, c=discord_id_pill_card: on_card_hover(e, c, theme["card"])
-    discord_id_pill = ft.GestureDetector(
-        mouse_cursor=ft.MouseCursor.CLICK,
-        content=discord_id_pill_card,
-    )
+    def _sync_launcher_fields(self) -> None:
+        self._discord_switch.setChecked(bool(self._settings.get("discord_rpc", True)))
+        self._logs_switch.setChecked(bool(self._settings.get("capture_logs", True)))
+        action = str(self._settings.get("launch_action", DEFAULT_SETTINGS["launch_action"]))
+        idx = self._launch_combo.findData(action)
+        if idx >= 0:
+            self._launch_combo.blockSignals(True)
+            self._launch_combo.setCurrentIndex(idx)
+            self._launch_combo.blockSignals(False)
 
-    creator_social_card = glass_panel(
-        bgcolor=theme["surface"],
-        border=ft.Border.all(1, color=theme["border"]),
-        border_radius=12,
-        padding=ft.Padding.all(20),
-        content=ft.Column(
-            spacing=16,
-            controls=[
-                # Developer info row
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Row(
-                            spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Container(
-                                    width=36,
-                                    height=36,
-                                    border_radius=8,
-                                    bgcolor=theme["card"],
-                                    border=ft.Border.all(1, color=theme["border"]),
-                                    alignment=ft.Alignment.CENTER,
-                                    content=ft.Icon(
-                                        ft.Icons.CODE_ROUNDED,
-                                        size=18,
-                                        color=theme["btn_primary"],
-                                    ),
-                                ),
-                                ft.Column(
-                                    spacing=2,
-                                    controls=[
-                                        ft.Text(
-                                            "Made with ❤️ by Jaydeep Patil",
-                                            size=14,
-                                            weight=ft.FontWeight.BOLD,
-                                            color=theme["text_primary"],
-                                        ),
-                                        ft.Text(
-                                            "Creator & Developer",
-                                            size=11,
-                                            color=theme["text_muted"]
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                        discord_id_pill,
-                    ],
-                ),
-                ft.Divider(height=1, color=theme["border"]),
-                # Connect & Support links row
-                ft.Row(
-                    spacing=12,
-                    controls=[
-                        # Discord Server item
-                        ft.Container(
-                            expand=True,
-                            bgcolor=theme["card"],
-                            border=ft.Border.all(1, color=theme["border"]),
-                            border_radius=10,
-                            padding=ft.Padding.symmetric(horizontal=14, vertical=12),
-                            content=ft.Row(
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                controls=[
-                                    ft.Row(
-                                        spacing=10,
-                                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                        controls=[
-                                            ft.Icon(
-                                                ft.Icons.DISCORD,
-                                                size=20,
-                                                color=theme["btn_primary"],
-                                            ),
-                                            ft.Column(
-                                                spacing=1,
-                                                controls=[
-                                                    ft.Text(
-                                                        "Discord Community",
-                                                        size=13,
-                                                        weight=ft.FontWeight.BOLD,
-                                                        color=theme["text_primary"],
-                                                    ),
-                                                    ft.Text(
-                                                        "Discord community",
-                                                        size=11,
-                                                        color=theme["text_muted"],
-                                                    ),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                    ft.Row(
-                                        spacing=4,
-                                        tight=True,
-                                        controls=[
-                                            ft.Button(
-                                                "Join",
-                                                icon=ft.Icons.OPEN_IN_NEW_ROUNDED,
-                                                bgcolor=theme["btn_primary"],
-                                                color=theme["btn_primary_text"],
-                                                style=rounded_button_style,
-                                                on_click=lambda e: open_url(
-                                                    "https://dsc.gg/_gr8",
-                                                    "Opening the Wisc Discord community",
-                                                ),
-                                            ),
-                                            ft.IconButton(
-                                                icon=ft.Icons.CONTENT_COPY_ROUNDED,
-                                                icon_size=16,
-                                                icon_color=theme["text_secondary"],
-                                                hover_color=theme["card_hover"],
-                                                tooltip=tooltip("Copy invite link"),
-                                                style=rounded_button_style,
-                                                on_click=lambda e: copy_to_clipboard(
-                                                    "https://dsc.gg/_gr8",
-                                                    "Copied the Discord community invite",
-                                                ),
-                                            ),
-                                        ],
-                                    ),
-                                ],
-                            ),
-                        ),
-                        # Buy Me a Coffee item
-                        ft.Container(
-                            expand=True,
-                            bgcolor=theme["card"],
-                            border=ft.Border.all(1, color=theme["border"]),
-                            border_radius=10,
-                            padding=ft.Padding.symmetric(horizontal=14, vertical=12),
-                            content=ft.Row(
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                controls=[
-                                    ft.Row(
-                                        spacing=10,
-                                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                        controls=[
-                                            ft.Icon(
-                                                ft.Icons.COFFEE_ROUNDED,
-                                                size=20,
-                                                color=theme["btn_primary"],
-                                            ),
-                                            ft.Column(
-                                                spacing=1,
-                                                controls=[
-                                                    ft.Text(
-                                                        "Buy Me a Coffee",
-                                                        size=13,
-                                                        weight=ft.FontWeight.BOLD,
-                                                        color=theme["text_primary"],
-                                                    ),
-                                                    ft.Text(
-                                                        "buymeacoffee.com/jaydeeeep",
-                                                        size=11,
-                                                        color=theme["text_muted"],
-                                                    ),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                    ft.Row(
-                                        spacing=4,
-                                        tight=True,
-                                        controls=[
-                                            ft.Button(
-                                                "Support",
-                                                icon=ft.Icons.FAVORITE_ROUNDED,
-                                                bgcolor=theme["btn_secondary"],
-                                                color=theme["btn_secondary_text"],
-                                                style=rounded_button_style,
-                                                on_click=lambda e: open_url(
-                                                    "https://buymeacoffee.com/jaydeeeep",
-                                                    "Opening Buy Me a Coffee...",
-                                                ),
-                                            ),
-                                            ft.IconButton(
-                                                icon=ft.Icons.CONTENT_COPY_ROUNDED,
-                                                icon_size=16,
-                                                icon_color=theme["text_secondary"],
-                                                hover_color=theme["card_hover"],
-                                                tooltip=tooltip("Copy donation link"),
-                                                style=rounded_button_style,
-                                                on_click=lambda e: copy_to_clipboard(
-                                                    "https://buymeacoffee.com/jaydeeeep",
-                                                    "Copied donation link to clipboard!",
-                                                ),
-                                            ),
-                                        ],
-                                    ),
-                                ],
-                            ),
-                        ),
-                    ],
-                ),
-            ],
-        ),
-    )
-    creator_social_card.on_hover = lambda e, c=creator_social_card: on_card_hover(e, c, theme["surface"])
+    # ── Updates ─────────────────────────────────────────────────────────────
+    def _build_updates_page(self) -> None:
+        from wisc.services import updates as launcher_updates
 
-    # 3. Game Directory & Specs Card (Clean, minimal)
-    storage_specs_card = glass_panel(
-        bgcolor=theme["surface"],
-        border=ft.Border.all(1, color=theme["border"]),
-        border_radius=12,
-        padding=ft.Padding.all(20),
-        content=ft.Column(
-            spacing=12,
-            horizontal_alignment=ft.CrossAxisAlignment.START,
-            controls=[
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Row(
-                            spacing=8,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Icon(
-                                    ft.Icons.FOLDER_OPEN_OUTLINED,
-                                    size=16,
-                                    color=theme["btn_primary"],
-                                ),
-                                ft.Text(
-                                    "Game Directory",
-                                    size=14,
-                                    weight=ft.FontWeight.BOLD,
-                                    color=theme["text_primary"],
-                                ),
-                            ],
-                        ),
-                        ft.Text(
-                            f"Palette: {selected_theme['name']}  •  RAM: {settings.get('ram_mb', 4096)} MB",
-                            size=11,
-                            color=theme["text_muted"],
-                        ),
-                    ],
-                ),
-                ft.Container(
-                    bgcolor=theme["card"],
-                    border=ft.Border.all(1, color=theme["border"]),
-                    border_radius=8,
-                    padding=ft.Padding.symmetric(horizontal=12, vertical=8),
-                    content=ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.Text(
-                                str(minecraft_directory),
-                                size=12,
-                                color=theme["text_secondary"],
-                                selectable=True,
-                                expand=True,
-                            ),
-                            ft.Row(
-                                spacing=6,
-                                tight=True,
-                                controls=[
-                                    ft.Button(
-                                        "Open Folder",
-                                        icon=ft.Icons.FOLDER_ROUNDED,
-                                        bgcolor=theme["btn_secondary"],
-                                        color=theme["btn_secondary_text"],
-                                        style=rounded_button_style,
-                                        on_click=lambda e: open_system_folder(
-                                            minecraft_directory
-                                        ),
-                                    ),
-                                    ft.IconButton(
-                                        icon=ft.Icons.CONTENT_COPY_ROUNDED,
-                                        icon_size=16,
-                                        icon_color=theme["text_secondary"],
-                                        hover_color=theme["card_hover"],
-                                        tooltip=tooltip("Copy path"),
-                                        style=rounded_button_style,
-                                        on_click=lambda e: copy_to_clipboard(
-                                            str(minecraft_directory),
-                                            "Copied game data path to clipboard!",
-                                        ),
-                                    ),
-                                ],
-                            ),
-                        ],
-                    ),
-                ),
-            ],
-        ),
-    )
-    storage_specs_card.on_hover = lambda e, c=storage_specs_card: on_card_hover(e, c, theme["surface"])
+        content = self._build_subpage_shell("options_updates", "Updates")
 
-    about_subpage = build_settings_page(
-        "About",
-        [
-            about_hero_card,
-            creator_social_card,
-            storage_specs_card,
-        ],
-    )
+        self._update_status_label = text_label("Check for the latest launcher release.", theme.FONT_BODY, muted=True)
+        self._check_updates_btn = GlassButton("Check for Updates", accented=True)
+        self._check_updates_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._check_updates_btn.clicked.connect(self._check_updates)
+        content.addWidget(
+            _setting_row(
+                f"Wisc {launcher_updates.version_label()}",
+                "Current launcher version and release status.",
+                control=self._check_updates_btn,
+                extra=self._update_status_label,
+            )
+        )
 
-    updates_subpage = build_settings_page("Updates", [features.updater.build_section(
-        lambda title, description, control: build_setting_container(title, description, control=control))]) if features else ft.Container()
+        self._auto_check_switch = GlassSwitch(
+            "Check automatically",
+            bool(self._settings.get("check_updates_automatically", True)),
+            self._colors["btn_primary"],
+        )
+        self._auto_check_switch.toggled.connect(lambda v: self._persist("check_updates_automatically", v))
+        self._switches.append(self._auto_check_switch)
+        content.addWidget(
+            _setting_row(
+                "Automatic Update Checks",
+                "Check for new Wisc releases in the background.",
+                control=self._auto_check_switch,
+            )
+        )
 
-    return {
-        "options": options_dashboard,
-        "options_ui": ui_subpage,
-        "options_java": java_subpage,
-        "options_game": game_subpage,
-        "options_accounts": accounts_subpage,
-        "options_launcher": launcher_subpage,
-        "options_about": about_subpage,
-        "options_updates": updates_subpage,
-    }
+        self._auto_dl_switch = GlassSwitch(
+            "Download automatically",
+            bool(self._settings.get("download_updates_automatically", False)),
+            self._colors["btn_primary"],
+        )
+        self._auto_dl_switch.toggled.connect(lambda v: self._persist("download_updates_automatically", v))
+        self._switches.append(self._auto_dl_switch)
+        content.addWidget(
+            _setting_row(
+                "Automatic Downloads",
+                "Download available updates automatically in the background.",
+                control=self._auto_dl_switch,
+            )
+        )
+        content.addStretch(1)
+
+    def _check_updates(self) -> None:
+        from wisc.services import updates as launcher_updates
+
+        self._check_updates_btn.setEnabled(False)
+        self._update_status_label.setText("Checking for updates...")
+
+        def run_check():
+            return launcher_updates.UpdateService().check(manual=True)
+
+        def on_done(release) -> None:
+            self._update_check_token = None
+            self._check_updates_btn.setEnabled(True)
+            if release is None:
+                self._update_status_label.setText("You're up to date.")
+            else:
+                self._update_status_label.setText(f"Update available: {release.version}")
+
+        def on_fail(error: Exception) -> None:
+            self._update_check_token = None
+            self._check_updates_btn.setEnabled(True)
+            self._update_status_label.setText(f"Could not check for updates: {error}")
+
+        self._update_check_token = self.runner.submit(run_check, on_done, on_fail)
+
+    # ── About ───────────────────────────────────────────────────────────────
+    def _build_about_page(self) -> None:
+        from wisc.services import updates as launcher_updates
+
+        content = self._build_subpage_shell("options_about", "About Wisc")
+
+        content.addWidget(
+            _setting_row(
+                f"Wisc Launcher ({launcher_updates.version_label()})",
+                "A clean, fast Minecraft launcher with themed glass surfaces and mod management.",
+            )
+        )
+
+        mc_dir = _minecraft_dir()
+        open_mc = GlassButton("Open Folder")
+        open_mc.setFixedHeight(theme.SEGMENT_HEIGHT)
+        open_mc.clicked.connect(lambda: _open_folder(mc_dir))
+        content.addWidget(
+            _setting_row(
+                "Game Directory",
+                str(mc_dir),
+                control=open_mc,
+            )
+        )
+
+        open_data = GlassButton("Open Folder")
+        open_data.setFixedHeight(theme.SEGMENT_HEIGHT)
+        open_data.clicked.connect(lambda: _open_folder(DATA_DIR))
+        content.addWidget(
+            _setting_row(
+                "Launcher Data",
+                str(DATA_DIR),
+                control=open_data,
+            )
+        )
+        content.addStretch(1)
+
+    def apply_theme(self, colors: dict[str, str]) -> None:
+        self._colors = colors
+        accent = colors["btn_primary"]
+        self._update_theme_dot()
+        self._hero_art.set_accent(accent)
+        for card in self._cards:
+            card.apply_accent(accent)
+        for switch in self._switches:
+            switch.set_accent(accent)
+        self.update()
+
+    def shutdown(self) -> None:
+        if self._update_check_token is not None:
+            self.runner.cancel(self._update_check_token)
+            self._update_check_token = None

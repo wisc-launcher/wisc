@@ -133,10 +133,8 @@ def load_offline_cosmetics(account_id: str) -> dict[str, str]:
     }
 
 
-def save_offline_cosmetic(account_id: str, kind: str, source: Path | str) -> dict[str, str]:
-    """Validate and copy a skin/cape PNG, then atomically save its selection."""
-    if not account_id or kind not in {"skin", "cape"}:
-        raise ValueError("Choose an offline account and a skin or cape.")
+def _read_cosmetic_png(kind: str, source: Path | str) -> tuple[Image.Image, bytes]:
+    """Validate Minecraft dimensions and normalize a single PNG before saving."""
     source = Path(source)
     if source.stat().st_size > 4 * 1024 * 1024:
         raise ValueError("Choose a PNG smaller than 4 MB.")
@@ -154,7 +152,14 @@ def save_offline_cosmetic(account_id: str, kind: str, source: Path | str) -> dic
             prepared.save(output, format="PNG")
     except Image.DecompressionBombError as error:
         raise ValueError("Choose a skin or cape PNG with Minecraft's supported dimensions.") from error
-    data = output.getvalue()
+    return prepared, output.getvalue()
+
+
+def save_offline_cosmetic(account_id: str, kind: str, source: Path | str) -> dict[str, str]:
+    """Validate and copy a skin/cape PNG, then atomically save its selection."""
+    if not account_id or kind not in {"skin", "cape"}:
+        raise ValueError("Choose an offline account and a skin or cape.")
+    prepared, data = _read_cosmetic_png(kind, source)
     filename = f"{kind}_{hashlib.sha256(data).hexdigest()[:20]}.png"
     directory = offline_cosmetics_dir(account_id)
     directory.mkdir(parents=True, exist_ok=True)
@@ -178,6 +183,36 @@ def save_offline_cosmetic(account_id: str, kind: str, source: Path | str) -> dic
     finally:
         temporary.unlink(missing_ok=True)
     return load_offline_cosmetics(account_id)
+
+
+def save_offline_skin_model(account_id: str, model: str) -> bool:
+    """Persist a manual model choice without replacing the skin or cape."""
+    if not account_id or model not in {"classic", "slim"}:
+        return False
+    settings = load_settings()
+    records = dict(settings.get("offline_cosmetics", {}))
+    records[account_id] = {**records.get(account_id, {}), "model": model}
+    settings["offline_cosmetics"] = records
+    return save_settings(settings)
+
+
+def save_custom_skin(source: Path | str) -> dict[str, str]:
+    """Copy a validated custom skin into launcher storage and select it."""
+    prepared, data = _read_cosmetic_png("skin", source)
+    model = "slim" if is_slim_skin(prepared) else "classic"
+    target = get_skins_dir() / f"custom_{hashlib.sha256(data).hexdigest()[:20]}.png"
+    existed = target.is_file()
+    temporary = target.with_suffix(".tmp")
+    try:
+        temporary.write_bytes(data)
+        temporary.replace(target)
+        if not save_active_skin_choice("custom", model=model, custom_path=str(target)):
+            if not existed:
+                target.unlink(missing_ok=True)
+            raise OSError("Could not save your selected skin.")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return load_active_skin_choice()
 
 
 def clear_offline_cosmetic(account_id: str, kind: str) -> bool:

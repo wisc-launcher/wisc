@@ -29,6 +29,67 @@ initializing a UI. Package initializers do not import their child modules.
 Some launch/profile/modpack operations use local imports to avoid circular
 dependencies; preserve that initialization order when moving code.
 
+## Qt migration preview
+
+The standalone PyQt6 Home, Library, Skins, and content UI runs with `python -m wisc.qt_app`. Install its
+dependency with `python -m pip install -r requirements-qt.txt` if needed.
+`wisc/qt_app.py` owns the preview window; `ui/qt_home.py`, `ui/qt_components.py`,
+and `ui/qt_theme.py` provide Home, shared artwork/glass controls, and styling.
+Keep Qt colors, fonts, border radii, painter appearance tokens, and stylesheet
+rules in `ui/qt_theme.py`; widget modules own layout and interaction.
+The window constructs Home first, warms Library's Python modules after the first
+paint, and creates secondary pages on demand. Page preparation runs on the
+service worker; Qt widgets are always constructed on the GUI thread.
+`ui/qt_library.py` uses the shared content model/view grid and profile-card painters
+to display only visible cards, with search, loader filters, and sorting.
+Home retains only the three or four visible shelf cards.
+`ui/qt_skins.py` loads the active launcher account on opening Skins and reuses
+the existing skin cache and Ely.by services. Skin changes happen on Ely.by;
+refreshing updates the preview and uses the model provided by Ely.by. `ui/qt_skin_viewer.py`
+publishes software-rendered frames with drag/keyboard rotation and view presets.
+`ui/qt_tasks.py` owns the background service loop and queued delivery to Qt;
+its executor has four workers. Hidden skin previews stop scheduling frames,
+retain at most one running render, and replace pending poses with the latest one.
+`ui/qt_mods.py` loads saved profiles on opening Mods and connects the existing
+mod, modpack, shader, and texture pack services. `ui/qt_content.py` provides
+native list models/delegates, local filtering,
+pagination, and Markdown. `ui/qt_content_details.py` and `ui/qt_content_install.py`
+share details and nonblocking reviews across those content types. Searches
+coalesce into one running request and one pending replacement. `ui/qt_progress.py`
+owns one persistent bottom progress bar for Home operations, content downloads,
+skin refreshes, and page loading. Active operations retain their progress and
+cancellation across navigation; the status row hides when idle. Higher-priority
+operations stay visible while background work finishes. Artwork gradients fade
+from the sides and bottom across Qt tabs, including their glass controls. Home
+retains full-strength shading; secondary pages use the same selected artwork
+with blur and gradients at 60% of Home's strength.
+Content details are constructed on first use. `ui/qt_images.py` supplies a shared
+32 MiB decoded-image cache and four decode slots across Home, Library, backgrounds,
+and content views. Image consumers suspend queued requests while hidden. Backgrounds
+decode for the current window size/DPR, and the Library's rendered-card cache is
+limited to 4 MiB. Confirmed installs keep their existing cancellation and commit guards.
+`LauncherComboBox` in `ui/qt_components.py` supplies the shared glass dropdown,
+with content-based widths, configurable field heights, and rounded menus bounded
+to the launcher window.
+`ui/qt_window.py` owns the custom title bar and shared Qt window actions.
+`ui/qt_geometry.py` uses Qt system move/resize with a manual geometry fallback;
+`ui/qt_native.py` is loaded only by the optional Windows integration.
+The preview uses bundled sample profiles, shares selection between Home and Library,
+supports theme changes, and exposes signals for service actions. Skins reads
+the active launcher account and synchronizes Ely.by skins with its existing
+storage; Home and Library still use sample profiles. Mods uses actual saved profiles,
+and modpack installs publish separate instances through the existing transaction service.
+Minecraft launching and the
+remaining pages are not connected yet. The Qt frontend does not load Flet;
+`python main.py` continues to run the existing launcher.
+See the [Qt Home screenshot](screenshots/wisc-qt-home.png),
+[Library screenshot](screenshots/wisc-qt-library.png),
+[Skins screenshot](screenshots/wisc-qt-skins.png), and
+[Mods screenshot](screenshots/wisc-qt-mods.png) for their current appearance.
+These captures use sample or local fixture data.
+
+## Flet shell
+
 `ui/shell.py` retains the selected artwork outside the navigation host and
 shares its pre-blurred cover with the fixed glass chrome and the full-window
 feature-page backdrop. Page content and dialogs stay in their existing host.
@@ -76,6 +137,7 @@ in a clone. Choose tests for the affected area; for example:
 python -B -m unittest temp.test_legacy_ui temp.test_ui_theme
 python -B -m unittest temp.test_launcher_artwork temp.test_home_layout
 python -B -m unittest temp.test_mod_services temp.test_modpack_services
+python -B -m unittest temp.test_qt_mods
 python -B -m unittest temp.test_launcher_updates temp.test_release_plan temp.test_release_tag
 python -B temp/run_wisc_checks.py temp.test_wisc_rename temp.test_wisc_branding
 ```

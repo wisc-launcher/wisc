@@ -1,4 +1,4 @@
-flet
+PyQt6>=6.11,<7
 minecraft-launcher-lib
 pillow
 requests
