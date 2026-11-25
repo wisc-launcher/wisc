@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import OrderedDict
+from math import hypot
 from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import (
     QAbstractListModel, QModelIndex, QPoint, QRect, QRectF, QSize,
-    QSortFilterProxyModel, Qt, QTimer, QUrl, pyqtSignal, QObject,
+    QSortFilterProxyModel, Qt, QTimer, QUrl, QVariantAnimation, pyqtSignal, QObject,
 )
 from PyQt6.QtGui import (
     QColor, QImage, QPainter, QPainterPath, QPalette, QPen, QPixmap,
@@ -23,8 +24,9 @@ from PyQt6.QtWidgets import (
 from wisc.mods.markdown import normalize_mod_markdown
 from wisc.ui import theme as theme
 from wisc.ui.components import (
-    GlassButton, GlassMenu, compose_profile_surface, paint_glass,
-    paint_profile_actions, paint_profile_caption, paint_switch, text_label,
+    REVEAL_TOTAL_MS, GlassButton, GlassMenu, compose_profile_surface, paint_glass,
+    paint_profile_actions, paint_profile_caption, paint_switch,
+    reveal_wave_sample, reveal_wave_window, text_label,
 )
 from wisc.ui.images import ContentImages
 from wisc.ui.theme import GLASS_OPACITY, MUTED, TEXT, ui_font
@@ -197,6 +199,11 @@ class ContentItemDelegate(QStyledItemDelegate):
         bounds = QRectF(option.rect.adjusted(0, 0, -1, -8))
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         painter.save()
+        opacity, dy = self.view.item_reveal_transform(option.rect)
+        if opacity < 1.0:
+            painter.setOpacity(opacity)
+        if dy:
+            painter.translate(0, dy)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         paint_glass(self.view.viewport(), painter, radius=theme.RADIUS_CARD,
                     opacity=GLASS_OPACITY + (theme.ROW_HOVER_OPACITY if hovered else 0), bounds=bounds)
@@ -302,7 +309,40 @@ class ContentList(QListView):
         self.on_accent = self.window().palette().highlightedText().color()
         self.actions_enabled = True
         self._pressed: tuple[str, str] | None = None
+        self._wave_progress = 1.0
+        self._wave_origin = QPoint(0, 0)
+        self._wave_anim = QVariantAnimation(self)
+        self._wave_anim.setDuration(REVEAL_TOTAL_MS)
+        self._wave_anim.valueChanged.connect(self._on_wave_step)
         images.ready.connect(self._image_ready)
+
+    def _on_wave_step(self, value: object) -> None:
+        self._wave_progress = float(value)
+        self.viewport().update()
+
+    def reveal_wave(self, origin: QPoint | None = None) -> None:
+        self._wave_anim.stop()
+        self._wave_origin = origin if origin is not None else QPoint(0, 0)
+        self._wave_progress = 0.0
+        self._wave_anim.setStartValue(0.0)
+        self._wave_anim.setEndValue(1.0)
+        self._wave_anim.start()
+        self.viewport().update()
+
+    def item_reveal_transform(self, rect: QRect) -> tuple[float, float]:
+        if self._wave_progress >= 1.0:
+            return 1.0, 0.0
+        vp = self.viewport()
+        ox = self._wave_origin.x()
+        oy = self._wave_origin.y()
+        max_dist = max(
+            hypot(max(abs(ox), abs(vp.width() - ox)), max(abs(oy), abs(vp.height() - oy))),
+            1.0,
+        )
+        center = rect.center()
+        dist = hypot(center.x() - ox, center.y() - oy)
+        start_t, span_t = reveal_wave_window(dist / max_dist)
+        return reveal_wave_sample(self._wave_progress, start_t, span_t)
 
     def _image_ready(self, key: str) -> None:
         if self.isVisible():
@@ -430,6 +470,11 @@ class ProfileCardDelegate(ContentItemDelegate):
         else:
             self.surfaces.move_to_end(key)
         painter.save()
+        opacity, dy = self.view.item_reveal_transform(option.rect)
+        if opacity < 1.0:
+            painter.setOpacity(opacity)
+        if dy:
+            painter.translate(0, dy)
         painter.translate(option.rect.topLeft())
         painter.drawPixmap(0, 0, surface)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)

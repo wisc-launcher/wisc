@@ -1,18 +1,21 @@
 """Artwork and compact controls shared by the new Qt frontend."""
 
 from functools import lru_cache
-from math import ceil
+from math import ceil, hypot
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QEvent, QPoint, QRectF, QSize, Qt
+from PyQt6.QtCore import (
+    QAbstractAnimation, QEasingCurve, QEvent, QObject, QParallelAnimationGroup,
+    QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QTimer, QVariantAnimation,
+)
 from PyQt6.QtGui import (
     QColor, QIcon, QImageReader, QLinearGradient, QPainter, QPainterPath, QPalette,
-    QPen, QPixmap,
+    QPen, QPixmap, QRegion,
 )
 from PyQt6.QtWidgets import (
     QAbstractButton, QAbstractItemView, QApplication, QComboBox, QFrame, QGraphicsBlurEffect,
-    QGraphicsScene, QLabel, QLineEdit, QListView, QMenu, QPushButton, QSizePolicy,
+    QGraphicsOpacityEffect, QGraphicsScene, QLabel, QLineEdit, QListView, QMenu, QPushButton, QSizePolicy,
     QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -123,6 +126,17 @@ class ArtworkBackground(QWidget):
         self._artwork = str(artwork)
         self._softened_artwork = self._find_softened_artwork()
         self._frosted = False
+        self._frost_progress = 0.0
+        self._frost_anim = QVariantAnimation(self)
+        self._frost_anim.setDuration(220)
+        self._frost_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._frost_anim.valueChanged.connect(self._on_frost_step)
+        self._artwork_prev_frame: QPixmap | None = None
+        self._artwork_progress = 1.0
+        self._artwork_anim = QVariantAnimation(self)
+        self._artwork_anim.setDuration(240)
+        self._artwork_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._artwork_anim.valueChanged.connect(self._on_artwork_step)
         self._home_shading = True
         self._frame_key: tuple[str, int, int, float, bool] | None = None
         self._frames: dict[bool, QPixmap] = {}
@@ -153,10 +167,17 @@ class ArtworkBackground(QWidget):
         crisp, limit, frosted, blur_limit, blur = self._image_sources()
         return {self._images.key(crisp, limit), self._images.key(frosted, blur_limit, blur=blur)}
 
+    def _on_frost_step(self, value: object) -> None:
+        self._frost_progress = float(value)
+        self.update()
+
     def set_frosted(self, frosted: bool) -> None:
         if self._frosted != frosted:
             self._frosted = frosted
-            self.update()
+            self._frost_anim.stop()
+            self._frost_anim.setStartValue(self._frost_progress)
+            self._frost_anim.setEndValue(1.0 if frosted else 0.0)
+            self._frost_anim.start()
 
     def set_home_shading(self, enabled: bool) -> None:
         if self._home_shading != enabled:
@@ -167,15 +188,53 @@ class ArtworkBackground(QWidget):
                 if child.isVisible():
                     child.update()
 
+    def _on_artwork_step(self, value: object) -> None:
+        self._artwork_progress = float(value)
+        if self._artwork_progress >= 1.0:
+            self._artwork_prev_frame = None
+        self.update()
+
     def set_artwork(self, artwork: Path) -> None:
         if str(artwork) != self._artwork:
+            prev = self._frames.get(self._frosted) or self._frames.get(False)
             self._artwork = str(artwork)
             self._softened_artwork = self._find_softened_artwork()
+            self._frames.clear()
+            self._last_images.clear()
+            if prev is not None and not prev.isNull():
+                self._artwork_prev_frame = prev
+                self._artwork_anim.stop()
+                self._artwork_progress = 0.0
+                self._artwork_anim.setStartValue(0.0)
+                self._artwork_anim.setEndValue(1.0)
+                self._artwork_anim.start()
+            else:
+                self._artwork_prev_frame = None
+                self._artwork_progress = 1.0
             self.update()
+
+    def _paint_current_artwork(self, painter: QPainter) -> None:
+        if self._frost_progress <= 0.0:
+            self.paint_artwork(painter, frosted=False)
+        elif self._frost_progress >= 1.0:
+            self.paint_artwork(painter, frosted=True)
+        else:
+            self.paint_artwork(painter, frosted=False)
+            painter.save()
+            painter.setOpacity(self._frost_progress)
+            self.paint_artwork(painter, frosted=True)
+            painter.restore()
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        self.paint_artwork(painter, frosted=self._frosted)
+        if self._artwork_prev_frame is not None and self._artwork_progress < 1.0:
+            painter.drawPixmap(0, 0, self._artwork_prev_frame)
+            painter.save()
+            painter.setOpacity(self._artwork_progress)
+            self._paint_current_artwork(painter)
+            painter.restore()
+        else:
+            self._paint_current_artwork(painter)
 
     def paint_artwork(self, painter: QPainter, *, frosted: bool = False) -> None:
         """Reuse one opaque frame per size/DPR for the backdrop and glass controls."""
@@ -208,7 +267,11 @@ class ArtworkBackground(QWidget):
             if image is not None:
                 self._last_images[frosted] = image
             else:
-                image = self._last_images.get(frosted, QPixmap())
+                image = self._last_images.get(frosted)
+                if image is None and not frosted and Path(self._artwork).is_file():
+                    image = artwork_image(self._artwork)
+                elif image is None:
+                    image = QPixmap()
         draw_cover(painter, image, bounds)
         strength = 1.0 if self._home_shading else theme.FEATURE_VIGNETTE_STRENGTH
         horizontal = QLinearGradient(0, 0, self.width(), 0)
@@ -829,3 +892,215 @@ class ProfileCard(QAbstractButton):
         paint_profile_caption(painter, self.title, self.details, self.width(), self.height(), self._accent,
                               selected=self.isChecked(), has_actions=self._actions_button is not None,
                               highlighted=self.underMouse() or bool(self.hasFocus() and self.property("keyboardFocus")))
+
+
+REVEAL_TOTAL_MS = 500
+REVEAL_SPREAD_MS = 100.0
+REVEAL_NEAR_MS = 320.0
+REVEAL_FAR_DELTA_MS = 80.0
+REVEAL_RISE_PX = 16.0
+
+
+def reveal_wave_window(ratio: float) -> tuple[float, float]:
+    """Return (start_t, span_t) in [0, 1] for an element at normalized distance ratio."""
+    clamped = max(0.0, min(1.0, ratio))
+    start_t = (clamped * REVEAL_SPREAD_MS) / REVEAL_TOTAL_MS
+    span_t = (REVEAL_NEAR_MS + clamped * REVEAL_FAR_DELTA_MS) / REVEAL_TOTAL_MS
+    return start_t, span_t
+
+
+def reveal_wave_sample(progress: float, start_t: float, span_t: float) -> tuple[float, float]:
+    """Return (opacity, dy_px) using OneClient-style OutCubic Soft Rise & Settle."""
+    local = max(0.0, min(1.0, (progress - start_t) / max(span_t, 1e-4)))
+    eased = 1.0 - (1.0 - local) ** 3
+    return eased, (1.0 - eased) * REVEAL_RISE_PX
+
+
+class _RevealOverlay(QWidget):
+    """Lightweight sub-pixel QPainter overlay for 60fps reveal waves."""
+
+    def __init__(self, parent: QWidget, items: list[tuple[QPixmap, QPointF, float, float]], rise_scale: float):
+        super().__init__(parent)
+        self._items = items
+        self._rise_scale = rise_scale
+        self._progress = 0.0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setGeometry(parent.rect())
+        self.raise_()
+        self.show()
+
+    def set_progress(self, progress: float) -> None:
+        self._progress = progress
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        for pixmap, origin, start_t, span_t in self._items:
+            opacity, dy = reveal_wave_sample(self._progress, start_t, span_t)
+            if opacity <= 0.0:
+                continue
+            painter.setOpacity(opacity)
+            painter.drawPixmap(QPointF(origin.x(), origin.y() + dy * self._rise_scale), pixmap)
+
+
+class StaggeredReveal(QObject):
+    """Interruptible, misplace-resistant OutCubic sub-pixel Soft Rise & Settle wave."""
+
+    def __init__(self, parent: QObject | None = None, *, duration_ms: int = REVEAL_TOTAL_MS,
+                 offset_y: float = REVEAL_RISE_PX, max_items: int = 24):
+        super().__init__(parent)
+        self._duration_ms = duration_ms
+        self._offset_y = float(offset_y)
+        self._max_items = max_items
+        self._widgets: list[QWidget] = []
+        self._overlay: _RevealOverlay | None = None
+        self._container: QWidget | None = None
+        self._generation = 0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(self._duration_ms)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.Linear)
+        self._anim.valueChanged.connect(self._on_step)
+        self._anim.finished.connect(self._on_finished)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self._container and event.type() in (QEvent.Type.Resize, QEvent.Type.Hide):
+            self.stop()
+        return super().eventFilter(watched, event)
+
+    def stop(self) -> None:
+        self._generation += 1
+        if self._anim.state() != QAbstractAnimation.State.Stopped:
+            self._anim.stop()
+        if self._container is not None:
+            try:
+                self._container.removeEventFilter(self)
+            except RuntimeError:
+                pass
+            self._container = None
+        if self._overlay is not None:
+            try:
+                self._overlay.hide()
+                self._overlay.deleteLater()
+            except RuntimeError:
+                pass
+            self._overlay = None
+        for widget in self._widgets:
+            try:
+                widget.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+        self._widgets.clear()
+
+    def reveal(self, container: QWidget, *, origin: QPoint | None = None,
+               targets: list[QWidget] | None = None) -> None:
+        self.stop()
+        gen = self._generation
+        QTimer.singleShot(0, lambda: self._start_wave(container, origin, targets, gen))
+
+    def _collect_targets(self, container: QWidget) -> list[QWidget]:
+        candidates: list[QWidget] = []
+        seen: set[int] = set()
+        for child in container.findChildren(QWidget):
+            if not child.isVisible() or child.width() < 20 or child.height() < 20:
+                continue
+            if isinstance(child, QListView):
+                continue
+            is_block = isinstance(child, (GlassPanel, ProfileCard)) or child.objectName() in ("homeHero", "launchBar")
+            is_control = isinstance(child, (QAbstractButton, QLineEdit, QComboBox))
+            if is_block or is_control:
+                parent = child.parentWidget()
+                skip = False
+                while parent is not None and parent is not container:
+                    if id(parent) in seen or isinstance(parent, QListView):
+                        skip = True
+                        break
+                    parent = parent.parentWidget()
+                if not skip:
+                    seen.add(id(child))
+                    candidates.append(child)
+        return candidates[:self._max_items]
+
+    def _activate_layouts(self, container: QWidget) -> None:
+        if container.layout() is not None:
+            container.layout().activate()
+        for child in container.findChildren(QWidget):
+            if child.layout() is not None and child.isVisible():
+                child.layout().activate()
+
+    def _start_wave(self, container: QWidget, origin: QPoint | None,
+                    targets: list[QWidget] | None, gen: int) -> None:
+        if gen != self._generation:
+            return
+        try:
+            if not container.isVisible():
+                return
+        except RuntimeError:
+            return
+
+        self._activate_layouts(container)
+        wave_origin = origin if origin is not None else QPoint(0, 0)
+
+        for view in container.findChildren(QListView):
+            if view.isVisible() and callable(getattr(view, "reveal_wave", None)):
+                view_origin = view.viewport().mapFrom(container, wave_origin)
+                view.reveal_wave(view_origin)
+
+        widgets = [w for w in (targets if targets is not None else self._collect_targets(container)) if w.isVisible()]
+        if not widgets:
+            return
+
+        scored: list[tuple[float, QWidget]] = []
+        for w in widgets:
+            center = w.mapTo(container, QPoint(w.width() // 2, w.height() // 2))
+            dist = hypot(center.x() - wave_origin.x(), center.y() - wave_origin.y())
+            scored.append((dist, w))
+        scored.sort(key=lambda item: item[0])
+
+        min_dist = scored[0][0]
+        max_dist = max(scored[-1][0], min_dist + 1.0)
+        span = max_dist - min_dist
+
+        overlay_items: list[tuple[QPixmap, QPointF, float, float]] = []
+        for dist, widget in scored:
+            ratio = (dist - min_dist) / span
+            start_t, span_t = reveal_wave_window(ratio)
+            dpr = widget.devicePixelRatioF()
+            pixmap = QPixmap(max(1, round(widget.width() * dpr)), max(1, round(widget.height() * dpr)))
+            pixmap.setDevicePixelRatio(dpr)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            was_translucent = widget.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            try:
+                widget.render(
+                    pixmap,
+                    QPoint(0, 0),
+                    QRegion(),
+                    QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren,
+                )
+            finally:
+                widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, was_translucent)
+            pos = QPointF(widget.mapTo(container, QPoint(0, 0)))
+            effect = QGraphicsOpacityEffect(widget)
+            effect.setOpacity(0.0)
+            widget.setGraphicsEffect(effect)
+            self._widgets.append(widget)
+            overlay_items.append((pixmap, pos, start_t, span_t))
+
+        self._container = container
+        container.installEventFilter(self)
+        rise_scale = self._offset_y / max(REVEAL_RISE_PX, 1e-4)
+        self._overlay = _RevealOverlay(container, overlay_items, rise_scale)
+        self._anim.setDuration(self._duration_ms)
+        self._anim.start()
+
+    def _on_step(self, value: object) -> None:
+        if self._overlay is not None:
+            self._overlay.set_progress(float(value))
+
+    def _on_finished(self) -> None:
+        self.stop()

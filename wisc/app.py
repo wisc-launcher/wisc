@@ -8,7 +8,7 @@ import sys
 import threading
 from typing import Sequence
 
-from PyQt6.QtCore import QEvent, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QStackedWidget, QVBoxLayout, QWidget
 
@@ -27,7 +27,7 @@ from wisc.services import launcher
 from wisc.services.artwork import resolve_background_artwork
 from wisc.services.discord_presence import DiscordPresence, SkinPortraitCache
 from wisc.ui import theme as theme
-from wisc.ui.components import ArtworkBackground, GlassPanel, text_label
+from wisc.ui.components import ArtworkBackground, GlassPanel, StaggeredReveal, text_label
 from wisc.ui.home import HomePage, HomeProfile
 from wisc.ui.images import ContentImages
 from wisc.ui.progress import ProgressHost
@@ -140,6 +140,7 @@ class QtLauncherWindow(FramelessWindow):
         self._launch_token: int | None = None
         self._launch_cancel: threading.Event | None = None
         self._closing = False
+        self._reveal = StaggeredReveal(self)
         self.presence = DiscordPresence(
             enabled=bool(settings.get("discord_rpc", True)),
             portrait_cache=SkinPortraitCache(DATA_DIR / "discord_portraits.json"),
@@ -258,6 +259,8 @@ class QtLauncherWindow(FramelessWindow):
         if page not in attributes:
             self.page_requested.emit(page)
             return
+        if page == self._current_page and self.pages.currentWidget() is not self._loading_page:
+            return
         self._current_page = page
         self.presence.set_page("settings" if page == "options" else ("library" if page == "installations" else page))
         self.background.set_frosted(page != "home")
@@ -265,7 +268,9 @@ class QtLauncherWindow(FramelessWindow):
         attribute = attributes[page]
         self.progress_host.set_operation("navigation", None)
         if page == "home" or getattr(self, "_" + attribute) is not None or attribute in self._prepared_modules:
-            self.pages.setCurrentWidget(getattr(self, attribute))
+            target_widget = getattr(self, attribute)
+            self.pages.setCurrentWidget(target_widget)
+            self._reveal.reveal(target_widget)
             return
         if self._loading_page is None:
             from wisc.ui.content import SkeletonList
@@ -286,6 +291,13 @@ class QtLauncherWindow(FramelessWindow):
             return
         self._start_preparation(page, attribute)
 
+    def _nav_origin(self, page: str, target_widget: QWidget) -> QPoint | None:
+        button = self.title_bar.buttons.get(page)
+        if button is None:
+            return None
+        global_pos = button.mapToGlobal(QPoint(button.width() // 2, button.height() // 2))
+        return target_widget.mapFromGlobal(global_pos)
+
     def _start_preparation(self, page: str, attribute: str) -> None:
         def ready(module) -> None:
             self._preparations.pop(page, None)
@@ -293,7 +305,9 @@ class QtLauncherWindow(FramelessWindow):
             if not self._closing and self._current_page == page:
                 self.progress_host.set_operation("navigation", None)
                 try:
-                    self.pages.setCurrentWidget(getattr(self, attribute))
+                    target_widget = getattr(self, attribute)
+                    self.pages.setCurrentWidget(target_widget)
+                    self._reveal.reveal(target_widget)
                 except Exception as error:
                     failed(error)
 

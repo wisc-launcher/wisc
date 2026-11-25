@@ -25,7 +25,7 @@ from wisc.mods.manager import (
 )
 from wisc.mods.modpacks import PackInstaller, PackPlan
 from wisc.mods.platform import ModPlatformClient
-from wisc.ui.components import ElidedLabel, GlassButton, GlassLineEdit, GlassPanel, LauncherComboBox, text_label
+from wisc.ui.components import ElidedLabel, GlassButton, GlassLineEdit, GlassPanel, LauncherComboBox, StaggeredReveal, text_label
 from wisc.ui.content import (
     ContentAction, ContentImages, ContentItem, ContentList, ContentPagination,
     SkeletonList, format_downloads, format_size,
@@ -228,6 +228,7 @@ class ModsPage(QWidget):
         header.addWidget(self.profile_selector)
         layout.addWidget(header_bar)
         self.body = QStackedWidget()
+        self._reveal = StaggeredReveal(self)
         layout.addWidget(self.body, 1)
         self.listing = QWidget()
         listing = QVBoxLayout(self.listing)
@@ -836,7 +837,10 @@ class ModsPage(QWidget):
         usable = packs or self._can_browse()
         loading = self._loading or self._scanning or self._loading_profiles
         if rows and usable:
+            was_list = self.results.currentWidget() is self.list
             self.results.setCurrentWidget(self.list)
+            if not was_list:
+                self._reveal.reveal(self.list)
         elif loading and usable:
             self.results.setCurrentWidget(self.skeleton)
         else:
@@ -897,6 +901,7 @@ class ModsPage(QWidget):
         self.details.open(item, self.kind, self.profile)
         self.details.set_release(self._release)
         self.body.setCurrentWidget(self.details)
+        self._reveal.reveal(self.details)
         self._render()
         self._load_details()
 
@@ -908,6 +913,7 @@ class ModsPage(QWidget):
         self._detail_item = None
         self._detail_loaded = False
         self.body.setCurrentWidget(self.listing)
+        self._reveal.reveal(self.listing)
         self._render()
 
     def _details_payload(self, item: ContentItem, profile: dict, kind: str, manager: ModManager | None,

@@ -56,6 +56,7 @@ from wisc.ui.components import (
     GlassLineEdit,
     GlassPanel,
     LauncherComboBox,
+    StaggeredReveal,
     paint_glass,
     paint_switch,
     text_label,
@@ -308,6 +309,7 @@ class OptionsPage(QWidget):
         self._theme_dot: QWidget | None = None
         self._theme_badge_label: QLabel | None = None
         self._update_check_token: int | None = None
+        self._reveal = StaggeredReveal(self)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(*theme.PAGE_MARGINS)
@@ -325,13 +327,15 @@ class OptionsPage(QWidget):
         self._build_launcher_page()
         self._build_updates_page()
         self._build_about_page()
-        self.show_subpage("options")
+        self.show_subpage("options", animate=False)
 
-    def show_subpage(self, key: str) -> None:
+    def show_subpage(self, key: str, *, animate: bool = True) -> None:
         widget = self._subpages.get(key) or self._subpages["options"]
         if key == "options_accounts":
             self._refresh_accounts_list()
         self.stack.setCurrentWidget(widget)
+        if animate and self.isVisible():
+            self._reveal.reveal(widget, targets=self._cards if key == "options" else None)
 
     def _persist(self, key: str, value: object) -> None:
         self._settings[key] = value
