@@ -120,7 +120,7 @@ class QtLauncherWindow(FramelessWindow):
         self.setMinimumSize(1100, 650)
         saved_theme = load_theme_choice(get_theme_names())
         settings = load_settings()
-        colors = get_theme(saved_theme, str(settings.get("custom_accent", "#46BA34")))
+        colors = get_theme(saved_theme)
         if profiles is None:
             loaded_profiles, raw_by_id = _load_saved_profiles()
         else:
@@ -276,20 +276,18 @@ class QtLauncherWindow(FramelessWindow):
             self._reveal.reveal(target_widget)
             return
         if self._loading_page is None:
-            from wisc.ui.content import SkeletonList
             self._loading_page = QWidget()
             loading_layout = QVBoxLayout(self._loading_page)
             loading_layout.setContentsMargins(*theme.PAGE_MARGINS)
             loading_layout.setSpacing(theme.PAGE_SPACING)
-            self._loading_label = text_label("", theme.FONT_PAGE_TITLE, bold=True)
+            self._loading_label = text_label("", theme.FONT_BODY, muted=True)
             loading_layout.addWidget(self._loading_label)
-            loading_layout.addWidget(SkeletonList(), 1)
+            loading_layout.addStretch(1)
             self.pages.addWidget(self._loading_page)
-        self._loading_label.setText(
-            {"library": "Library", "skins": "Skins", "mods": "Mods & Modpacks", "options": "Options"}[attribute]
-        )
+        title = {"library": "Library", "skins": "Skins", "mods": "Mods & Modpacks", "options": "Settings"}[attribute]
+        self._loading_label.setText("")
         self.pages.setCurrentWidget(self._loading_page)
-        self.progress_host.set_operation("navigation", self._loading_label.text(), priority=10, show_text=False)
+        self.progress_host.set_operation("navigation", title, priority=10, show_text=False)
         if page in self._preparations:
             return
         self._start_preparation(page, attribute)
@@ -516,12 +514,7 @@ class QtLauncherWindow(FramelessWindow):
                                          priority=10, show_text=False)
 
     def apply_theme(self, name: str) -> None:
-        custom_accent = None
-        if name == "Custom":
-            from wisc.core.storage import load_settings
-            from wisc.core.themes import DEFAULT_CUSTOM_ACCENT
-            custom_accent = str(load_settings().get("custom_accent", DEFAULT_CUSTOM_ACCENT))
-        colors = get_theme(name, custom_accent) if custom_accent else get_theme(name)
+        colors = get_theme(name)
         self._colors = colors
         palette = dark_palette(colors)
         QApplication.instance().setPalette(palette)

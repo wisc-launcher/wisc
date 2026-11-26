@@ -1,8 +1,8 @@
 ### Changed
 
-- Refresh Settings with descriptive category cards, a responsive layout, and quick access to About Wisc and the welcome tour.
-- Give settings pages consistent glass cards, clearer controls, and headers that stay visible while scrolling.
+- Redesigned the Settings dashboard with a centered 3×2 frosted-glass card grid (`UI`, `Java`, `Game`, `Accounts`, `Launcher`, and `About`) and theme-tinted monochrome vector icons.
+- Moved launcher update controls into `Settings > About` and styled the Java RAM slider and account prompts to match the active glass theme.
 
-### Fixed
+### Removed
 
-- Include Discord activity sharing when resetting Launcher settings to defaults.
+- Removed the `Custom` color picker and `Color studio` banner; saved custom theme selections now fall back to `Earth 2`.

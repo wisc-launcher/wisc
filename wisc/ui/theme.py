@@ -275,6 +275,12 @@ def stylesheet(colors: dict[str, str]) -> str:
         QMenu::item:selected {{ background: {selection_fill}; }}
         QProgressBar {{ background: rgba(255, 255, 255, 12); border: 0; border-radius: 3px; }}
         QProgressBar::chunk {{ background: {accent}; border-radius: 3px; }}
+        QSlider::groove:horizontal {{ background: rgba(255, 255, 255, 22); height: 6px; border-radius: 3px; }}
+        QSlider::sub-page:horizontal {{ background: {accent}; border-radius: 3px; }}
+        QSlider::handle:horizontal {{
+            background: {accent}; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px;
+        }}
+        QSlider::handle:horizontal:hover {{ background: {colors['btn_primary_hover']}; }}
         QLabel[progressStatus="true"] {{ color: #FFFFFF; }}
         QToolTip {{ background: #171C14; color: {TEXT}; border: 0; padding: 8px; }}
     """

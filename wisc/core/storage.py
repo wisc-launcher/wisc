@@ -12,7 +12,6 @@ import minecraft_launcher_lib
 
 from wisc.core.credentials import CredentialStore, _tokens
 from wisc.core.paths import RESOURCE_ROOT, launcher_data_dir
-from wisc.core.themes import DEFAULT_CUSTOM_ACCENT, normalize_accent
 
 LEGACY_DATA_DIR = RESOURCE_ROOT / ".data"
 
@@ -98,7 +97,6 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "launch_action": "Hide launcher",
     "capture_logs": True,
     "enable_orbs": True,
-    "custom_accent": DEFAULT_CUSTOM_ACCENT,
     "offline_cosmetics": {},
     "enable_custom_skins": True,
     "discord_rpc": True,
@@ -146,7 +144,6 @@ def load_settings() -> dict[str, object]:
     if "active_skin" in saved and isinstance(saved["active_skin"], dict):
         settings["active_skin"] = saved["active_skin"]
 
-    settings["custom_accent"] = normalize_accent(saved.get("custom_accent")) or DEFAULT_CUSTOM_ACCENT
     cosmetics = saved.get("offline_cosmetics")
     if isinstance(cosmetics, dict):
         settings["offline_cosmetics"] = {

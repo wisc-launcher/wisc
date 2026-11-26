@@ -14,12 +14,11 @@ from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QAbstractButton,
-    QColorDialog,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QScrollArea,
     QSlider,
@@ -44,10 +43,8 @@ from wisc.core.storage import (
     update_offline_username,
 )
 from wisc.core.themes import (
-    DEFAULT_CUSTOM_ACCENT,
     DEFAULT_THEME,
     get_theme_names,
-    normalize_accent,
 )
 from wisc.ui import theme as theme
 from wisc.ui.components import (
@@ -130,18 +127,18 @@ def _minecraft_dir() -> Path:
 
 
 class SettingsArt(QWidget):
-    """Vector illustration from .assets/settings/<name>.svg tinted with the active accent."""
+    """Vector icon from .assets/settings/<name>.svg tinted with the active accent."""
 
-    def __init__(self, name: str, accent: str, size: int = 56, parent: QWidget | None = None):
+    def __init__(self, name: str, accent: str, size: int = 34, parent: QWidget | None = None):
         super().__init__(parent)
         self._name = name
-        self._accent = normalize_accent(accent) or theme.DEFAULT_ACCENT
+        self._accent = QColor(accent).name() if QColor(accent).isValid() else theme.DEFAULT_ACCENT
         self._renderer: QSvgRenderer | None = None
         self.setFixedSize(size, size)
         self._reload()
 
     def set_accent(self, accent: str) -> None:
-        normalized = normalize_accent(accent) or theme.DEFAULT_ACCENT
+        normalized = QColor(accent).name() if QColor(accent).isValid() else theme.DEFAULT_ACCENT
         if normalized != self._accent:
             self._accent = normalized
             self._reload()
@@ -152,7 +149,9 @@ class SettingsArt(QWidget):
         if not svg_path.is_file():
             self._renderer = None
             return
-        raw = svg_path.read_text(encoding="utf-8").replace("#46BA34", self._accent)
+        raw = svg_path.read_text(encoding="utf-8")
+        for token in ("#FFFFFF", "#ffffff", "#46BA34"):
+            raw = raw.replace(token, self._accent)
         self._renderer = QSvgRenderer(QByteArray(raw.encode("utf-8")), self)
 
     def paintEvent(self, event) -> None:
@@ -204,28 +203,24 @@ class GlassSwitch(QAbstractButton):
 class OptionCard(QAbstractButton):
     """Clickable frosted category card on the Settings dashboard."""
 
-    def __init__(self, category_id: str, title: str, description: str, art_name: str,
+    def __init__(self, category_id: str, title: str, art_name: str,
                  accent: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.category_id = category_id
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(112)
+        self.setMinimumSize(196, 146)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(14)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 22, 20, 22)
+        layout.setSpacing(12)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.art = SettingsArt(art_name, accent, size=48, parent=self)
-        layout.addWidget(self.art, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.art = SettingsArt(art_name, accent, size=34, parent=self)
+        layout.addWidget(self.art, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        text_col = QVBoxLayout()
-        text_col.setSpacing(4)
-        text_col.addWidget(text_label(title, theme.FONT_SUBHEADING, bold=True))
-        desc = text_label(description, theme.FONT_DETAIL, muted=True)
-        desc.setWordWrap(True)
-        text_col.addWidget(desc)
-        text_col.addStretch(1)
-        layout.addLayout(text_col, 1)
+        title_lbl = text_label(title, theme.FONT_SUBHEADING, bold=True)
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
 
     def apply_accent(self, accent: str) -> None:
         self.art.set_accent(accent)
@@ -244,6 +239,55 @@ class OptionCard(QAbstractButton):
             radius=theme.RADIUS_CARD,
             opacity=min(1.0, theme.GLASS_OPACITY + interaction),
         )
+
+
+class _GlassInputDialog(QDialog):
+    """Frameless frosted-glass text prompt matching the launcher theme."""
+
+    def __init__(self, title: str, prompt: str, text: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMinimumWidth(360)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        panel = GlassPanel(radius=theme.RADIUS_PANEL)
+        outer.addWidget(panel)
+
+        body = QVBoxLayout(panel)
+        body.setContentsMargins(22, 20, 22, 20)
+        body.setSpacing(12)
+        body.addWidget(text_label(title, theme.FONT_DIALOG_TITLE, bold=True))
+        body.addWidget(text_label(prompt, theme.FONT_BODY, muted=True))
+
+        self._input = GlassLineEdit()
+        self._input.setText(text)
+        self._input.selectAll()
+        self._input.returnPressed.connect(self.accept)
+        body.addWidget(self._input)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        actions.addStretch(1)
+        cancel_btn = GlassButton("Cancel")
+        cancel_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = GlassButton("Save", accented=True)
+        ok_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        ok_btn.clicked.connect(self.accept)
+        actions.addWidget(cancel_btn)
+        actions.addWidget(ok_btn)
+        body.addLayout(actions)
+
+    def value(self) -> str:
+        return self._input.text().strip()
+
+    @classmethod
+    def get_text(cls, parent: QWidget | None, title: str, prompt: str, text: str = "") -> tuple[str, bool]:
+        dialog = cls(title, prompt, text, parent=parent)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        return dialog.value(), accepted
 
 
 def _setting_row(
@@ -308,8 +352,6 @@ class OptionsPage(QWidget):
         self._max_ram = _system_memory_mb()
         self._cards: list[OptionCard] = []
         self._switches: list[GlassSwitch] = []
-        self._theme_dot: QWidget | None = None
-        self._theme_badge_label: QLabel | None = None
         self._update_check_token: int | None = None
         self._reveal = StaggeredReveal(self)
 
@@ -327,11 +369,12 @@ class OptionsPage(QWidget):
         self._build_game_page()
         self._build_accounts_page()
         self._build_launcher_page()
-        self._build_updates_page()
         self._build_about_page()
         self.show_subpage("options", animate=False)
 
     def show_subpage(self, key: str, *, animate: bool = True) -> None:
+        if key == "options_updates":
+            key = "options_about"
         widget = self._subpages.get(key) or self._subpages["options"]
         if key == "options_accounts":
             self._refresh_accounts_list()
@@ -388,93 +431,56 @@ class OptionsPage(QWidget):
         self._subpages["options"] = scroll
         self.stack.addWidget(scroll)
 
-        header = QHBoxLayout()
-        header.setSpacing(12)
-        title_col = QVBoxLayout()
-        title_col.setSpacing(4)
-        title_col.addWidget(text_label("Settings", theme.FONT_PAGE_TITLE, bold=True))
-        title_col.addWidget(text_label("Make Wisc feel at home.", theme.FONT_BODY, muted=True))
-        header.addLayout(title_col, 1)
+        content.addStretch(1)
 
-        badge = GlassPanel(radius=theme.RADIUS_BUTTON)
-        badge_row = QHBoxLayout(badge)
-        badge_row.setContentsMargins(12, 8, 12, 8)
-        badge_row.setSpacing(8)
-        self._theme_dot = QWidget()
-        self._theme_dot.setFixedSize(8, 8)
-        self._update_theme_dot()
-        badge_row.addWidget(self._theme_dot)
-        current_theme = load_theme_choice(get_theme_names())
-        self._theme_badge_label = text_label(current_theme, theme.FONT_DETAIL, muted=True)
-        badge_row.addWidget(self._theme_badge_label)
-        header.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
-        content.addLayout(header)
+        center_row = QHBoxLayout()
+        center_row.addStretch(1)
 
-        hero = GlassPanel(radius=theme.RADIUS_CARD)
-        hero_row = QHBoxLayout(hero)
-        hero_row.setContentsMargins(22, 18, 22, 18)
-        hero_row.setSpacing(18)
-        hero_col = QVBoxLayout()
-        hero_col.setSpacing(8)
-        hero_col.addWidget(text_label("Color studio", theme.FONT_DIALOG_TITLE, bold=True))
-        hero_col.addWidget(
-            text_label("Dial in your own accent and switch Minecraft palettes anytime.", theme.FONT_BODY, muted=True)
-        )
-        customize_btn = GlassButton("Customize your colors", accented=True)
-        customize_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
-        customize_btn.clicked.connect(lambda: self.show_subpage("options_ui"))
-        hero_col.addWidget(customize_btn, 0, Qt.AlignmentFlag.AlignLeft)
-        hero_row.addLayout(hero_col, 1)
-        hero_art = SettingsArt("appearance", self._colors["btn_primary"], size=68, parent=hero)
-        self._hero_art = hero_art
-        hero_row.addWidget(hero_art, 0, Qt.AlignmentFlag.AlignVCenter)
-        content.addWidget(hero)
+        center_box = QWidget()
+        center_box.setMaximumWidth(740)
+        center_col = QVBoxLayout(center_box)
+        center_col.setContentsMargins(0, 0, 0, 0)
+        center_col.setSpacing(24)
 
         categories = [
-            ("options_ui", "Appearance", "Your colors, your atmosphere", "appearance"),
-            ("options_java", "Java & Memory", "Java executable and allocated RAM", "java"),
-            ("options_game", "Game", "Window size, fullscreen and skins", "game"),
-            ("options_accounts", "Accounts", "Manage players, sign-ins and skins", "accounts"),
-            ("options_launcher", "Launcher", "Launch behavior, Discord and logs", "launcher"),
-            ("options_updates", "Updates", "Check for the latest Wisc release", "updates"),
+            ("options_ui", "UI", "palette"),
+            ("options_java", "Java", "core"),
+            ("options_game", "Game", "game"),
+            ("options_accounts", "Accounts", "account"),
+            ("options_launcher", "Launcher", "sliders"),
+            ("options_about", "About", "info"),
         ]
         grid = QGridLayout()
-        grid.setSpacing(12)
-        for index, (cat_id, title, desc, art) in enumerate(categories):
-            card = OptionCard(cat_id, title, desc, art, self._colors["btn_primary"])
+        grid.setSpacing(16)
+        for index, (cat_id, title, art) in enumerate(categories):
+            card = OptionCard(cat_id, title, art, self._colors["btn_primary"])
             card.clicked.connect(lambda checked=False, target=cat_id: self.show_subpage(target))
             self._cards.append(card)
             grid.addWidget(card, index // 3, index % 3)
         for col in range(3):
             grid.setColumnStretch(col, 1)
-        content.addLayout(grid)
+        center_col.addLayout(grid)
 
-        footer = GlassPanel(radius=theme.RADIUS_CARD)
-        footer_row = QHBoxLayout(footer)
-        footer_row.setContentsMargins(18, 12, 18, 12)
-        footer_row.setSpacing(12)
-        brand_col = QVBoxLayout()
-        brand_col.setSpacing(2)
-        brand = text_label("Wisc", theme.FONT_SUBHEADING, pixel=True)
-        brand_col.addWidget(brand)
-        brand_col.addWidget(text_label("A little help for your next adventure.", theme.FONT_DETAIL, muted=True))
-        footer_row.addLayout(brand_col, 1)
-        about_btn = GlassButton("About Wisc")
-        about_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
-        about_btn.clicked.connect(lambda: self.show_subpage("options_about"))
-        footer_row.addWidget(about_btn)
-        content.addWidget(footer)
+        quote = text_label(
+            '"Keep a water bucket for the fall, and keep trusted people close when life gets steep."',
+            theme.FONT_DETAIL,
+            muted=True,
+        )
+        quote_font = quote.font()
+        quote_font.setItalic(True)
+        quote.setFont(quote_font)
+        quote.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        quote.setWordWrap(True)
+        center_col.addWidget(quote)
+
+        center_row.addWidget(center_box, 1)
+        center_row.addStretch(1)
+        content.addLayout(center_row)
         content.addStretch(1)
 
-    def _update_theme_dot(self) -> None:
-        if self._theme_dot is not None:
-            self._theme_dot.setStyleSheet(
-                f"background: {self._colors['btn_primary']}; border-radius: 4px;"
-            )
-
-    # ── Appearance ──────────────────────────────────────────────────────────
+    # ── UI / Appearance ─────────────────────────────────────────────────────
     def _build_appearance_page(self) -> None:
-        content = self._build_subpage_shell("options_ui", "Appearance", self._reset_appearance)
+        content = self._build_subpage_shell("options_ui", "UI", self._reset_appearance)
 
         self._theme_combo = LauncherComboBox()
         self._theme_combo.setMinimumWidth(220)
@@ -488,32 +494,8 @@ class OptionsPage(QWidget):
         content.addWidget(
             _setting_row(
                 "Minecraft palettes",
-                "Start with a favorite palette, or return to your saved Custom color.",
+                "Choose a Minecraft palette for accents, selections, and focus.",
                 control=self._theme_combo,
-            )
-        )
-
-        custom_row = QWidget()
-        custom_layout = QHBoxLayout(custom_row)
-        custom_layout.setContentsMargins(0, 0, 0, 0)
-        custom_layout.setSpacing(8)
-        self._accent_input = GlassLineEdit()
-        self._accent_input.setFixedWidth(120)
-        self._accent_input.setText(str(self._settings.get("custom_accent", DEFAULT_CUSTOM_ACCENT)))
-        pick_btn = GlassButton("Pick color")
-        pick_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
-        pick_btn.clicked.connect(self._pick_custom_color)
-        apply_btn = GlassButton("Apply", accented=True)
-        apply_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
-        apply_btn.clicked.connect(self._apply_custom_accent)
-        custom_layout.addWidget(self._accent_input)
-        custom_layout.addWidget(pick_btn)
-        custom_layout.addWidget(apply_btn)
-        content.addWidget(
-            _setting_row(
-                "Custom color",
-                "Choose a hex accent for buttons, selections, and focus.",
-                control=custom_row,
             )
         )
 
@@ -538,38 +520,11 @@ class OptionsPage(QWidget):
         if not isinstance(name, str) or not name:
             return
         save_theme_choice(name)
-        if self._theme_badge_label is not None:
-            self._theme_badge_label.setText(name)
         self.theme_requested.emit(name)
-
-    def _pick_custom_color(self) -> None:
-        initial = QColor(normalize_accent(self._accent_input.text()) or self._colors["btn_primary"])
-        chosen = QColorDialog.getColor(initial, self, "Choose Custom Accent")
-        if chosen.isValid():
-            self._accent_input.setText(chosen.name().upper())
-            self._apply_custom_accent()
-
-    def _apply_custom_accent(self) -> None:
-        normalized = normalize_accent(self._accent_input.text())
-        if not normalized:
-            return
-        self._accent_input.setText(normalized)
-        self._persist("custom_accent", normalized)
-        save_theme_choice("Custom")
-        idx = self._theme_combo.findData("Custom")
-        if idx >= 0:
-            self._theme_combo.blockSignals(True)
-            self._theme_combo.setCurrentIndex(idx)
-            self._theme_combo.blockSignals(False)
-        if self._theme_badge_label is not None:
-            self._theme_badge_label.setText("Custom")
-        self.theme_requested.emit("Custom")
 
     def _reset_appearance(self) -> None:
         self._persist("enable_orbs", DEFAULT_SETTINGS["enable_orbs"])
-        self._persist("custom_accent", DEFAULT_SETTINGS["custom_accent"])
         self._orbs_switch.setChecked(bool(DEFAULT_SETTINGS["enable_orbs"]))
-        self._accent_input.setText(str(DEFAULT_SETTINGS["custom_accent"]))
         save_theme_choice(DEFAULT_THEME)
         idx = self._theme_combo.findData(DEFAULT_THEME)
         if idx >= 0:
@@ -830,10 +785,10 @@ class OptionsPage(QWidget):
             )
 
     def _add_offline_account(self) -> None:
-        name, ok = QInputDialog.getText(self, "Add Offline Account", "Player username:")
-        if ok and name.strip():
+        name, ok = _GlassInputDialog.get_text(self, "Add Offline Account", "Player username:")
+        if ok and name:
             add_or_update_account(
-                {"id": uuid.uuid4().hex, "type": "offline", "username": name.strip()},
+                {"id": uuid.uuid4().hex, "type": "offline", "username": name},
                 set_as_active=True,
             )
             self._refresh_accounts_list()
@@ -843,9 +798,9 @@ class OptionsPage(QWidget):
         self._refresh_accounts_list()
 
     def _rename_offline(self, account_id: str, current: str) -> None:
-        name, ok = QInputDialog.getText(self, "Rename Offline Account", "New username:", text=current)
-        if ok and name.strip():
-            update_offline_username(account_id, name.strip())
+        name, ok = _GlassInputDialog.get_text(self, "Rename Offline Account", "New username:", text=current)
+        if ok and name:
+            update_offline_username(account_id, name)
             self._refresh_accounts_list()
 
     def _delete_account(self, account_id: str) -> None:
@@ -924,11 +879,11 @@ class OptionsPage(QWidget):
             self._launch_combo.setCurrentIndex(idx)
             self._launch_combo.blockSignals(False)
 
-    # ── Updates ─────────────────────────────────────────────────────────────
-    def _build_updates_page(self) -> None:
+    # ── About & Updates ─────────────────────────────────────────────────────
+    def _build_about_page(self) -> None:
         from wisc.services import updates as launcher_updates
 
-        content = self._build_subpage_shell("options_updates", "Updates")
+        content = self._build_subpage_shell("options_about", "About")
 
         self._update_status_label = text_label("Check for the latest launcher release.", theme.FONT_BODY, muted=True)
         self._check_updates_btn = GlassButton("Check for Updates", accented=True)
@@ -936,8 +891,8 @@ class OptionsPage(QWidget):
         self._check_updates_btn.clicked.connect(self._check_updates)
         content.addWidget(
             _setting_row(
-                f"Wisc {launcher_updates.version_label()}",
-                "Current launcher version and release status.",
+                f"Wisc Launcher ({launcher_updates.version_label()})",
+                "A clean, fast Minecraft launcher with themed glass surfaces and mod management.",
                 control=self._check_updates_btn,
                 extra=self._update_status_label,
             )
@@ -972,6 +927,29 @@ class OptionsPage(QWidget):
                 control=self._auto_dl_switch,
             )
         )
+
+        mc_dir = _minecraft_dir()
+        open_mc = GlassButton("Open Folder")
+        open_mc.setFixedHeight(theme.SEGMENT_HEIGHT)
+        open_mc.clicked.connect(lambda: _open_folder(mc_dir))
+        content.addWidget(
+            _setting_row(
+                "Game Directory",
+                str(mc_dir),
+                control=open_mc,
+            )
+        )
+
+        open_data = GlassButton("Open Folder")
+        open_data.setFixedHeight(theme.SEGMENT_HEIGHT)
+        open_data.clicked.connect(lambda: _open_folder(DATA_DIR))
+        content.addWidget(
+            _setting_row(
+                "Launcher Data",
+                str(DATA_DIR),
+                control=open_data,
+            )
+        )
         content.addStretch(1)
 
     def _check_updates(self) -> None:
@@ -998,48 +976,9 @@ class OptionsPage(QWidget):
 
         self._update_check_token = self.runner.submit(run_check, on_done, on_fail)
 
-    # ── About ───────────────────────────────────────────────────────────────
-    def _build_about_page(self) -> None:
-        from wisc.services import updates as launcher_updates
-
-        content = self._build_subpage_shell("options_about", "About Wisc")
-
-        content.addWidget(
-            _setting_row(
-                f"Wisc Launcher ({launcher_updates.version_label()})",
-                "A clean, fast Minecraft launcher with themed glass surfaces and mod management.",
-            )
-        )
-
-        mc_dir = _minecraft_dir()
-        open_mc = GlassButton("Open Folder")
-        open_mc.setFixedHeight(theme.SEGMENT_HEIGHT)
-        open_mc.clicked.connect(lambda: _open_folder(mc_dir))
-        content.addWidget(
-            _setting_row(
-                "Game Directory",
-                str(mc_dir),
-                control=open_mc,
-            )
-        )
-
-        open_data = GlassButton("Open Folder")
-        open_data.setFixedHeight(theme.SEGMENT_HEIGHT)
-        open_data.clicked.connect(lambda: _open_folder(DATA_DIR))
-        content.addWidget(
-            _setting_row(
-                "Launcher Data",
-                str(DATA_DIR),
-                control=open_data,
-            )
-        )
-        content.addStretch(1)
-
     def apply_theme(self, colors: dict[str, str]) -> None:
         self._colors = colors
         accent = colors["btn_primary"]
-        self._update_theme_dot()
-        self._hero_art.set_accent(accent)
         for card in self._cards:
             card.apply_accent(accent)
         for switch in self._switches:
