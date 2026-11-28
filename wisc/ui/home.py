@@ -1,13 +1,14 @@
 """Qt Home composition; service actions are delivered through explicit signals."""
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
 from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QPushButton, QStyle,
+    QApplication, QComboBox, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QStyle,
     QVBoxLayout, QWidget,
 )
 
@@ -15,7 +16,7 @@ from wisc.core.paths import ASSETS_DIR
 from wisc.ui import theme as theme
 from wisc.ui.components import (
     ElidedLabel, GlassButton, LauncherComboBox, ProfileCard,
-    artwork_image, build_profile_actions_menu, text_label,
+    artwork_image, asset_icon, build_profile_actions_menu, played_ago, text_label,
 )
 from wisc.ui.images import ContentImages
 from wisc.ui.theme import ui_font
@@ -30,6 +31,7 @@ class HomeProfile:
     artwork: Path
     icon: Path
     installed: bool = True
+    last_played: float | None = None
 
 
 class HomePage(QWidget):
@@ -55,8 +57,11 @@ class HomePage(QWidget):
         self._profiles_by_id = {profile.id: profile for profile in profiles}
         self._images = images
         self._accent = colors["btn_primary"]
+        self._accent_text = colors.get("btn_primary_text", theme.TEXT)
+        self._action_icons: dict[str, QIcon] = {}
         self._selected: HomeProfile | None = None
         self._busy = False
+        self._running = False
         self._cards: dict[str, ProfileCard] = {}
         self._notice = QTimer(self)
         self._notice.setSingleShot(True)
@@ -85,18 +90,21 @@ class HomePage(QWidget):
         hero.addSpacing(8)
         self.title = ElidedLabel()
         self.title.setFont(ui_font(theme.FONT_HERO, bold=True))
-        self.title.setFixedHeight(64)
+        self.title.setFixedHeight(theme.HERO_TITLE_HEIGHT)
         hero.addWidget(self.title)
         hero.addSpacing(8)
-        self.details = text_label("", theme.FONT_LABEL, muted=True)
+        self.details = ElidedLabel()
+        self.details.setFont(ui_font(theme.FONT_LABEL))
+        self.details.setProperty("muted", True)
         hero.addWidget(self.details)
         hero.addSpacing(20)
         actions = QHBoxLayout()
         actions.setSpacing(8)
         self.play_button = QPushButton()
         self.play_button.setObjectName("launch")
-        self.play_button.setFixedWidth(184)
+        self.play_button.setFixedWidth(theme.LAUNCH_BUTTON_WIDTH)
         self.play_button.setFixedHeight(theme.PRIMARY_BUTTON_HEIGHT)
+        self.play_button.setIconSize(QSize(18, 18))
         self.play_button.clicked.connect(self._play)
         actions.addWidget(self.play_button)
         self.edit_button = GlassButton("Edit")
@@ -130,7 +138,7 @@ class HomePage(QWidget):
         self._shelf.setSpacing(12)
         self.new_profile = GlassButton(radius=theme.RADIUS_CARD)
         self.new_profile.setObjectName("newProfile")
-        self.new_profile.setFixedSize(112, 150)
+        self.new_profile.setFixedSize(theme.PROFILE_TILE_WIDTH, theme.PROFILE_TILE_HEIGHT)
         self.new_profile.setAccessibleName("Create a new profile")
         self.new_profile.setCursor(Qt.CursorShape.PointingHandCursor)
         tile = QVBoxLayout(self.new_profile)
@@ -162,7 +170,7 @@ class HomePage(QWidget):
             self.select_profile(selected_id if selected_id in self._profiles_by_id else profiles[0].id)
         else:
             self.title.setText("No profiles")
-            self.details.setText("")
+            self.details.setText(self._empty_details_text())
             self._refresh_actions()
             self._restore_status()
 
@@ -186,11 +194,7 @@ class HomePage(QWidget):
             raise ValueError("Home profile IDs must be unique.")
         self._profiles = list(profiles)
         self._profiles_by_id = {profile.id: profile for profile in profiles}
-        for card in self._cards.values():
-            self._shelf.removeWidget(card)
-            card.hide()
-            card.deleteLater()
-        self._cards.clear()
+        # Cards are pruned by _refresh_shelf, so the shelf is never emptied and rebuilt.
         count = len(self._profiles)
         self._shelf_count.setText(f"{count} profile{'s' if count != 1 else ''}")
         if self._profiles:
@@ -203,7 +207,7 @@ class HomePage(QWidget):
         else:
             self._selected = None
             self.title.setText("No profiles")
-            self.details.setText("")
+            self.details.setText(self._empty_details_text())
             self._refresh_actions()
             self._refresh_shelf()
             self._restore_status()
@@ -216,7 +220,7 @@ class HomePage(QWidget):
             return
         self._selected = profile
         self.title.setText(profile.name)
-        self.details.setText(f"{profile.version}  \u00b7  {profile.loader}")
+        self.details.setText(self._details_text(profile))
         self._notice.stop()
         self._refresh_actions()
         self._refresh_shelf()
@@ -225,8 +229,11 @@ class HomePage(QWidget):
 
     def apply_theme(self, colors: dict[str, str]) -> None:
         self._accent = colors["btn_primary"]
+        self._accent_text = colors.get("btn_primary_text", theme.TEXT)
+        self._action_icons.clear()
         for card in self._cards.values():
             card.set_accent(colors["btn_primary"])
+        self._refresh_actions()
 
     def show_notice(self, message: str, duration: int = 5000) -> None:
         self.status.setText(message)
@@ -246,25 +253,82 @@ class HomePage(QWidget):
     def _restore_status(self) -> None:
         self.status.setText("")
 
+    def set_running(self, running: bool) -> None:
+        """Reflect an active game process on the launch button."""
+        running = bool(running)
+        if running == self._running:
+            return
+        self._running = running
+        self._refresh_actions()
+
+    def _details_text(self, profile: HomeProfile) -> str:
+        text = f"{profile.version}  \u00b7  {profile.loader}"
+        played = played_ago(profile.last_played)
+        return f"{text}  \u00b7  {played}" if played else text
+
+    @staticmethod
+    def _empty_details_text() -> str:
+        return "Create your first profile to start playing."
+
+    def _action_icon(self, name: str) -> QIcon:
+        key = f"{name}:{self._accent_text}"
+        icon = self._action_icons.get(key)
+        if icon is None:
+            icon = asset_icon(ASSETS_DIR / "tab-icons" / f"{name}.svg", self._accent_text)
+            self._action_icons[key] = icon
+        return icon
+
+    def update_played(self, profile_id: str, timestamp: float) -> None:
+        """Show a fresh last-played label without reloading every profile."""
+        profile = self._profiles_by_id.get(profile_id)
+        if profile is None:
+            return
+        updated = replace(profile, last_played=timestamp)
+        self._profiles_by_id[profile_id] = updated
+        self._profiles = [updated if item.id == profile_id else item for item in self._profiles]
+        if self._selected is not None and self._selected.id == profile_id:
+            self._selected = updated
+            self.details.setText(self._details_text(updated))
+
     def _refresh_actions(self) -> None:
         selected = self._selected is not None
-        self.play_button.setEnabled(selected or self._busy)
+        has_profiles = bool(self._profiles)
+        if not has_profiles:
+            text = "New profile"
+        elif self._busy:
+            text = "Cancel"
+        elif self._running:
+            text = "Running"
+        elif selected and self._selected.installed:
+            text = "Play"
+        else:
+            text = "Install && Play"
+        self.play_button.setText(text)
+        self.play_button.setIcon(self._action_icon("stop" if self._busy else "play"))
+        self.play_button.setEnabled(not self._running and (self._busy or not has_profiles or selected))
         self.edit_button.setEnabled(selected and not self._busy)
         self.folder_button.setEnabled(selected and not self._busy)
-        text = "Cancel" if self._busy else "Play" if selected and self._selected.installed else "Install && Play"
-        self.play_button.setText(text)
-        icon = QStyle.StandardPixmap.SP_MediaStop if self._busy else QStyle.StandardPixmap.SP_MediaPlay
-        self.play_button.setIcon(self.style().standardIcon(icon))
 
     def _request(self, signal) -> None:
-        if self._selected and not self._busy:
+        if self._selected and not self._busy and not self._running:
             signal.emit(self._selected.id)
 
     def _play(self) -> None:
-        if self._busy:
+        if not self._profiles:
+            self.create_requested.emit()
+        elif self._busy:
             self.cancel_requested.emit()
-        else:
+        elif not self._running:
             self._request(self.launch_requested)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            focused = QApplication.focusWidget()
+            if not isinstance(focused, (QLineEdit, QPlainTextEdit, QComboBox)):
+                self._play()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def _refresh_shelf(self) -> None:
         slots = 4 if self.width() >= 1366 else 3

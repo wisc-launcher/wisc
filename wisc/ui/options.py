@@ -9,11 +9,12 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QByteArray, QRectF, QSize, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QPainter
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QAbstractButton,
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
@@ -47,7 +48,9 @@ from wisc.core.themes import (
     DEFAULT_THEME,
     get_theme_names,
 )
+from wisc.services import java as java_runtimes
 from wisc.ui import theme as theme
+from wisc.ui.theme import ui_font
 from wisc.ui.components import (
     ElidedLabel,
     GlassButton,
@@ -479,6 +482,7 @@ class OptionsPage(QWidget):
     theme_requested = pyqtSignal(str)
     settings_changed = pyqtSignal(dict)
     accounts_changed = pyqtSignal()
+    java_progress = pyqtSignal(str)
 
     def __init__(
         self,
@@ -487,11 +491,14 @@ class OptionsPage(QWidget):
         parent: QWidget | None = None,
         *,
         updater=None,
+        progress: Callable[[str | None, int | None], None] | None = None,
     ):
         super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.runner = runner
         self._colors = colors
         self._updater = updater
+        self._progress_callback = progress
         self._settings = load_settings()
         self._cards: list[OptionCard] = []
         self._switches: list[GlassSwitch] = []
@@ -514,7 +521,8 @@ class OptionsPage(QWidget):
     def show_subpage(self, key: str, *, animate: bool = True) -> None:
         if key == "options_updates":
             key = "options_about"
-        if key not in self._subpages:
+        first_build = key not in self._subpages
+        if first_build:
             build_page = {
                 "options_ui": self._build_appearance_page,
                 "options_java": self._build_java_page,
@@ -528,8 +536,10 @@ class OptionsPage(QWidget):
         widget = self._subpages.get(key) or self._subpages["options"]
         if key == "options_accounts":
             self._refresh_accounts_list()
+        if key == "options_java" and hasattr(self, "_sync_java_fields"):
+            self._sync_java_fields()
         self.stack.setCurrentWidget(widget)
-        if animate and self.isVisible():
+        if animate and not first_build and self.isVisible():
             self._reveal.reveal(widget, targets=self._cards if key == "options" else None)
 
     def _persist(self, key: str, value: object) -> None:
@@ -741,8 +751,37 @@ class OptionsPage(QWidget):
         content.addWidget(
             _setting_row(
                 "Java Executable",
-                "Leave empty to use system Java, or select/detect your java.exe.",
+                "Leave empty to use Automatic Java, which installs the runtime each version needs. "
+                "Select or detect an installation only to override it.",
                 control=java_row,
+            )
+        )
+
+        runtime_controls = QWidget()
+        runtime_layout = QHBoxLayout(runtime_controls)
+        runtime_layout.setContentsMargins(0, 0, 0, 0)
+        runtime_layout.setSpacing(8)
+        self._java_runtime_download_btn = GlassButton("Download Java", accented=True)
+        self._java_runtime_download_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._java_runtime_download_btn.clicked.connect(self._download_java_runtime)
+        self._java_use_auto_btn = GlassButton("Use Automatic")
+        self._java_use_auto_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._java_use_auto_btn.clicked.connect(lambda: self._java_input.setText(""))
+        runtime_layout.addWidget(self._java_runtime_download_btn)
+        runtime_layout.addWidget(self._java_use_auto_btn)
+
+        self._java_runtime_status = ElidedLabel()
+        self._java_runtime_status.setFont(ui_font(theme.FONT_DETAIL))
+        self._java_runtime_status.setProperty("muted", True)
+        self._java_runtime_status.setMinimumWidth(240)
+        self.java_progress.connect(self._java_runtime_status.setText)
+
+        content.addWidget(
+            _setting_row(
+                "Java Runtime",
+                "Version-matched Java managed by the launcher. It downloads before the first launch that needs it.",
+                control=runtime_controls,
+                extra=self._java_runtime_status,
             )
         )
 
@@ -794,6 +833,7 @@ class OptionsPage(QWidget):
         self._jvm_args_input.blockSignals(True)
         self._jvm_args_input.setText(str(self._settings.get("jvm_arguments", "")))
         self._jvm_args_input.blockSignals(False)
+        self._refresh_java_runtime()
 
     def _auto_detect_java(self) -> None:
         from wisc.services.launcher import detect_java_installations
@@ -840,6 +880,105 @@ class OptionsPage(QWidget):
         )
         if path:
             self._java_input.setText(path)
+
+    def _java_requirement(self) -> tuple[str, str, str | None, int | None]:
+        """Resolve the Java runtime the saved profile selection needs."""
+        from wisc.core.storage import load_installations
+        from wisc.services import launcher
+
+        selected = str(self._settings.get("last_selected_profile") or "")
+        profile = next(
+            (item for item in load_installations() if str(item.get("id", "")) == selected),
+            None,
+        )
+        if profile is None:
+            return "", "", None, None
+        name = str(profile.get("name") or profile.get("id") or "Selected profile")
+        version_id = launcher.get_profile_version_id(profile) or ""
+        root = _minecraft_dir()
+        component: str | None = None
+        major: int | None = None
+        if version_id:
+            component, major = java_runtimes.runtime_for_version(version_id, root)
+        if not major:
+            minecraft_version = str(profile.get("minecraft_version") or "")
+            if minecraft_version:
+                component, major = java_runtimes.runtime_for_version(minecraft_version, root)
+        return name, version_id, component, major
+
+    def _refresh_java_runtime(self) -> None:
+        if not hasattr(self, "_java_runtime_status"):
+            return
+        name, version_id, component, major = self._java_requirement()
+        if not major:
+            self._java_runtime_status.setText(
+                "Automatic: the launcher installs the Java runtime each version needs."
+            )
+            self._java_runtime_download_btn.setEnabled(False)
+            return
+        installed = java_runtimes.runtime_executable(component, _minecraft_dir())
+        detail = f"Java {major} ({component})" if component else f"Java {major}"
+        if installed:
+            text = f"{name}: {detail} is installed."
+        else:
+            text = f"{name}: {detail} is not installed yet; it downloads before the first launch."
+        manual = str(self._settings.get("java_path", "")).strip()
+        if manual:
+            selected_major = java_runtimes.java_major(manual)
+            if selected_major and selected_major != major:
+                text += f" The selected Java is {selected_major} and cannot run this version."
+        self._java_runtime_status.setText(text)
+        self._java_runtime_download_btn.setEnabled(not installed)
+
+    def _report_java(self, message: str | None, percent: int | None = None) -> None:
+        """Publish Java progress to the page label and the shared progress host."""
+        if message:
+            self.java_progress.emit(message)
+        if self._progress_callback is not None:
+            self._progress_callback(message, percent)
+
+    def _download_java_runtime(self) -> None:
+        name, version_id, component, major = self._java_requirement()
+        if not component:
+            return
+        self._java_runtime_download_btn.setEnabled(False)
+        self.java_progress.emit(f"Downloading Java {major}...")
+        state = {"max": 100}
+
+        def report_status(text: str) -> None:
+            self._report_java(f"Java {major}: {text}")
+
+        def report_max(value: int) -> None:
+            state["max"] = max(1, int(value) or 100)
+
+        def report_progress(value: int) -> None:
+            done = max(0, min(int(value), state["max"]))
+            percent = done * 100 // state["max"]
+            self._report_java(f"Downloading Java {major}... {percent}%", percent)
+
+        def work() -> str | None:
+            return java_runtimes.ensure_runtime(
+                component,
+                _minecraft_dir(),
+                callback={
+                    "setStatus": report_status,
+                    "setMax": report_max,
+                    "setProgress": report_progress,
+                },
+            )
+
+        def on_done(path: str | None) -> None:
+            message = f"Java {major} is ready." if path else f"Java {major} could not be installed."
+            self._report_java(message)
+            self._report_java(None)
+            self._refresh_java_runtime()
+
+        def on_fail(error: Exception) -> None:
+            self._report_java(f"Could not download Java {major}: {error}")
+            self._report_java(None)
+            self._refresh_java_runtime()
+
+        self.runner.submit(work, on_done, on_fail)
 
     # ── Game ────────────────────────────────────────────────────────────────
     def _build_game_page(self) -> None:
@@ -1199,11 +1338,12 @@ class OptionsPage(QWidget):
 
         content = self._build_subpage_shell("options_about", "About")
 
-        self._update_status_label = text_label(
-            self._updater.status_message if self._updater else "Check for the latest launcher release.",
-            theme.FONT_BODY,
-            muted=True,
+        self._update_status_label = ElidedLabel(
+            self._updater.status_message if self._updater else "Check for the latest launcher release."
         )
+        self._update_status_label.setFont(ui_font(theme.FONT_BODY))
+        self._update_status_label.setProperty("muted", True)
+        self._update_status_label.setMinimumWidth(240)
         update_btns = QWidget()
         update_row = QHBoxLayout(update_btns)
         update_row.setContentsMargins(0, 0, 0, 0)
@@ -1234,6 +1374,12 @@ class OptionsPage(QWidget):
         )
         self._cancel_update_btn.hide()
         update_row.addWidget(self._cancel_update_btn)
+
+        # Reserve the update buttons' space so the row never reflows when they appear.
+        for button in (self._view_update_btn, self._cancel_update_btn):
+            policy = button.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            button.setSizePolicy(policy)
 
         content.addWidget(
             _setting_row(
@@ -1307,6 +1453,17 @@ class OptionsPage(QWidget):
             )
         )
 
+        self._diagnostics_btn = GlassButton("Copy Info")
+        self._diagnostics_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._diagnostics_btn.clicked.connect(self._copy_diagnostics)
+        content.addWidget(
+            _setting_row(
+                "Diagnostics",
+                "Copy the launcher version, system, and Java details for a bug report.",
+                control=self._diagnostics_btn,
+            )
+        )
+
         open_data = GlassButton("Open Folder")
         open_data.setFixedHeight(theme.SEGMENT_HEIGHT)
         open_data.clicked.connect(lambda: _open_folder(DATA_DIR))
@@ -1341,6 +1498,63 @@ class OptionsPage(QWidget):
         self._view_update_btn.setVisible(has_release and phase != "checking")
         self._view_update_btn.setText("Restart Now" if phase == "ready" else "View Update")
         self._cancel_update_btn.setVisible(phase == "downloading")
+
+    def _diagnostics_text(self) -> str:
+        """Plain-text environment summary that is safe to paste into an issue."""
+        import platform
+        import sys as _sys
+
+        from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
+
+        from wisc.core.paths import application_root
+        from wisc.core.storage import get_data_dir
+
+        version = "unknown"
+        try:
+            version = (application_root() / "VERSION").read_text(encoding="utf-8").strip() or "unknown"
+        except OSError:
+            pass
+        _, _, component, major = self._java_requirement()
+        java_path = str(self._settings.get("java_path", "")).strip()
+        if java_path:
+            selected_major = java_runtimes.java_major(java_path)
+            selected = f"{java_path} (Java {selected_major or 'unknown'})"
+        else:
+            selected = "automatic"
+        managed = java_runtimes.runtime_executable(component, _minecraft_dir())
+        managed_text = managed or f"not installed (Java {major or 'unknown'} needed)"
+        return "\n".join((
+            f"Wisc {version}",
+            f"System: {platform.platform()}",
+            f"Python: {_sys.version.split()[0]}",
+            f"Qt: {QT_VERSION_STR} (PyQt {PYQT_VERSION_STR})",
+            f"Selected Java: {selected}",
+            f"Managed Java: {managed_text}",
+            f"Data: {get_data_dir()}",
+        ))
+
+    def _copy_diagnostics(self) -> None:
+        try:
+            text = self._diagnostics_text()
+        except Exception as error:
+            text = f"Wisc diagnostics unavailable: {error}"
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+        self._diagnostics_btn.setText("Copied")
+        QTimer.singleShot(1600, self._reset_diagnostics_button)
+
+    def _reset_diagnostics_button(self) -> None:
+        if hasattr(self, "_diagnostics_btn"):
+            self._diagnostics_btn.setText("Copy Info")
+
+    def keyPressEvent(self, event) -> None:
+        dashboard = self._subpages.get("options")
+        if event.key() == Qt.Key.Key_Escape and self.stack.currentWidget() is not dashboard:
+            self.show_subpage("options")
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _show_release_notes(self) -> None:
         if self._updater is not None:

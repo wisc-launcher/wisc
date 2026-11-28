@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import QHBoxLayout, QPushButton, QStackedWidget, QVBoxLayou
 
 from wisc.ui import theme as theme
 from wisc.ui.components import (
-    GlassLineEdit, LauncherComboBox, text_label,
+    GlassButton, GlassLineEdit, GlassPanel, LauncherComboBox, played_ago, text_label,
 )
 from wisc.ui.images import ContentImages
 from wisc.ui.content import ContentItem, ProfileGrid
@@ -79,9 +79,23 @@ class LibraryPage(QWidget):
         empty_layout = QVBoxLayout(self.empty_host)
         empty_layout.setContentsMargins(0, 0, 0, 0)
         empty_layout.addStretch(1)
-        self.empty = text_label("No profiles", theme.FONT_LABEL, muted=True)
-        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        empty_layout.addWidget(self.empty, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_card = GlassPanel(radius=theme.RADIUS_CARD)
+        empty_card.setMaximumWidth(420)
+        card_layout = QVBoxLayout(empty_card)
+        card_layout.setContentsMargins(28, 24, 28, 24)
+        card_layout.setSpacing(10)
+        self.empty_title = text_label("No profiles yet", theme.FONT_DIALOG_TITLE, bold=True)
+        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(self.empty_title)
+        self.empty_note = text_label("Create a profile to start playing.", theme.FONT_BODY, muted=True)
+        self.empty_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_note.setWordWrap(True)
+        card_layout.addWidget(self.empty_note)
+        self.empty_create = GlassButton("New profile", accented=True)
+        self.empty_create.setFixedHeight(theme.BUTTON_HEIGHT)
+        self.empty_create.clicked.connect(self.create_requested.emit)
+        card_layout.addWidget(self.empty_create, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_layout.addWidget(empty_card, 0, Qt.AlignmentFlag.AlignHCenter)
         empty_layout.addStretch(1)
         self.results.addWidget(self.empty_host)
         layout.addWidget(self.results, 1)
@@ -98,6 +112,11 @@ class LibraryPage(QWidget):
     def hideEvent(self, event) -> None:
         self._images.set_visible(False)
         super().hideEvent(event)
+
+    def focus_search(self) -> None:
+        """Focus the profile search field (Ctrl+F)."""
+        self.search.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search.selectAll()
 
     def set_selected(self, profile_id: str) -> None:
         self._selected_id = profile_id
@@ -140,12 +159,28 @@ class LibraryPage(QWidget):
 
     def _reflow(self) -> None:
         profiles = self._visible_profiles()
-        signature = tuple(profile.id for profile in profiles)
+        signature = tuple((profile.id, profile.last_played) for profile in profiles)
         if signature == self._layout_signature:
             return
         self._layout_signature = signature
         self.count.setText(f"{len(profiles)} profile{'s' if len(profiles) != 1 else ''}")
-        self.scroll.set_items([ContentItem(profile.id, profile.name,
-                                          details=f"{profile.version} \u00b7 {profile.loader}", payload=profile)
-                               for profile in profiles])
-        self.results.setCurrentWidget(self.scroll if profiles else self.empty_host)
+        if profiles:
+            self.scroll.set_items([ContentItem(profile.id, profile.name,
+                                              details=self._details(profile), payload=profile)
+                                   for profile in profiles])
+            self.results.setCurrentWidget(self.scroll)
+        else:
+            filtered = bool(self._profiles)
+            self.empty_title.setText("No matches" if filtered else "No profiles yet")
+            self.empty_note.setText(
+                "Try a different search or loader filter." if filtered
+                else "Create a profile to start playing. Existing Minecraft installations are imported automatically."
+            )
+            self.empty_create.setVisible(not filtered)
+            self.results.setCurrentWidget(self.empty_host)
+
+    @staticmethod
+    def _details(profile: HomeProfile) -> str:
+        text = f"{profile.version} \u00b7 {profile.loader}"
+        played = played_ago(profile.last_played)
+        return f"{text} \u00b7 {played}" if played else text

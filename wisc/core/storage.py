@@ -4,6 +4,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 from functools import wraps
 from pathlib import Path
@@ -316,6 +317,19 @@ def save_latest_release_options(options: dict[str, str]) -> bool:
         load_installations(),
         latest_release_options=options,
     )
+
+
+def mark_profile_played(profile_id: str) -> bool:
+    """Record the last time a saved profile was launched."""
+    if not profile_id:
+        return False
+    installations = load_installations()
+    for item in installations:
+        if str(item.get("id", "")) != profile_id:
+            continue
+        item["last_played"] = time.time()
+        return save_installations(installations)
+    return False
 
 
 def save_installations(

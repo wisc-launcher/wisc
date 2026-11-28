@@ -1,5 +1,6 @@
 """Artwork and compact controls shared by the new Qt frontend."""
 
+import time
 from functools import lru_cache
 from math import ceil, exp, hypot
 from pathlib import Path
@@ -116,6 +117,20 @@ def text_label(text: str, size: int, *, bold: bool = False, muted: bool = False,
     label.setFont(ui_font(size, bold=bold, pixel=pixel))
     label.setProperty("muted", muted)
     return label
+
+
+def played_ago(timestamp: float | None) -> str:
+    """Compact relative time for a profile's last launch."""
+    if not timestamp:
+        return ""
+    delta = max(0.0, time.time() - float(timestamp))
+    if delta < 90:
+        return "played just now"
+    if delta < 3600:
+        return f"played {int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"played {int(delta // 3600)}h ago"
+    return f"played {int(delta // 86400)}d ago"
 
 
 class ArtworkBackground(QWidget):
@@ -1205,6 +1220,9 @@ class StaggeredReveal(QObject):
             return
         try:
             if not container.isVisible():
+                return
+            # A page that has not been laid out yet cannot be animated without snapping.
+            if container.width() <= 8 or container.height() <= 8:
                 return
         except RuntimeError:
             return

@@ -10,10 +10,11 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING, Sequence
 
 from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QApplication, QMessageBox, QStackedWidget, QVBoxLayout, QWidget
 
 from wisc.core.credentials import redact_credentials
@@ -102,6 +103,11 @@ def _load_saved_profiles() -> tuple[list[HomeProfile], dict[str, dict]]:
                 artwork=art_path,
                 icon=icon_path,
                 installed=(not installed_ids) or (vid in installed_ids),
+                last_played=(
+                    float(item["last_played"])
+                    if isinstance(item.get("last_played"), (int, float))
+                    else None
+                ),
             )
         )
     if not profiles:
@@ -146,7 +152,7 @@ class QtLauncherWindow(FramelessWindow):
         self.setWindowTitle("Wisc")
         self.setWindowIcon(QIcon(str(ASSETS_DIR / "icons" / "wisc.ico")))
         self.resize(1100, 650)
-        self.setMinimumSize(1100, 650)
+        self.setMinimumSize(theme.WINDOW_MIN_WIDTH, theme.WINDOW_MIN_HEIGHT)
         self._home_ready = False
         self._startup_profiles = profiles if defer_startup else None
         self._startup_token: int | None = None
@@ -173,6 +179,8 @@ class QtLauncherWindow(FramelessWindow):
         self._pending_options_subpage: str | None = None
         self._requested_mod_profile = None
         self._launch_token: int | None = None
+        self._game_running = False
+        self._focus_search_attempts = 0
         self._launch_cancel: threading.Event | None = None
         self._closing = False
         self._explicit_preview = (not defer_startup) and (profiles is not None)
@@ -247,6 +255,7 @@ class QtLauncherWindow(FramelessWindow):
         self.progress_host.cancel_requested.connect(self._cancel_operation)
         layout.addWidget(self.progress_host)
         self.toasts = ToastHost(self.background, self._colors["btn_primary"])
+        self.toasts.set_bottom_offset(theme.PROGRESS_HOST_HEIGHT + 8)
         self.updater = UpdateController(
             self.services,
             parent_widget=lambda: self,
@@ -268,6 +277,7 @@ class QtLauncherWindow(FramelessWindow):
         self.home.action_requested.connect(self._library_action)
         self.home.account_requested.connect(self._open_accounts)
         self.home.logs_requested.connect(self._show_logs)
+        self._install_shortcuts()
         self._refresh_home_account()
         self.apply_theme(data.theme_name)
         self._home_ready = True
@@ -358,6 +368,8 @@ class QtLauncherWindow(FramelessWindow):
         self._logs_window.append_line(line, sensitive_values)
 
     def _on_game_exited(self, return_code: int, profile_name: str) -> None:
+        self._game_running = False
+        self.home.set_running(False)
         if self._logs_window is not None:
             self._logs_window.set_running(False)
         if self.presence is not None:
@@ -459,7 +471,12 @@ class QtLauncherWindow(FramelessWindow):
     def options(self):
         if self._options is None:
             from wisc.ui.options import OptionsPage
-            self._options = OptionsPage(self.services, self._colors, updater=self.updater)
+            self._options = OptionsPage(
+                self.services,
+                self._colors,
+                updater=self.updater,
+                progress=self._report_options_progress,
+            )
             self._options.theme_requested.connect(self.apply_theme)
             self._options.accounts_changed.connect(self._refresh_home_account)
             self._options.settings_changed.connect(self._on_settings_changed)
@@ -469,6 +486,46 @@ class QtLauncherWindow(FramelessWindow):
     def _on_settings_changed(self, settings: dict) -> None:
         if self.presence is not None:
             self.presence.set_enabled(bool(settings.get("discord_rpc", True)))
+
+    def _install_shortcuts(self) -> None:
+        """Bind the launcher's global keyboard shortcuts once Home exists."""
+        for index, page in enumerate(("home", "installations", "skins", "mods", "options"), start=1):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{index}"), self)
+            shortcut.activated.connect(lambda target=page: self.navigate(target))
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._focus_search)
+        QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self._show_logs)
+
+    def _focus_search(self) -> None:
+        if self._current_page == "installations" and self._library is not None:
+            self._library.focus_search()
+            return
+        if self._current_page == "mods" and self._mods is not None:
+            self._mods.focus_search()
+            return
+        self.navigate("installations")
+        self._focus_search_attempts = 0
+        QTimer.singleShot(150, self._focus_search_when_ready)
+
+    def _focus_search_when_ready(self) -> None:
+        if self._library is not None:
+            self._library.focus_search()
+            return
+        # The Library builds on the service worker; wait for it instead of losing focus.
+        self._focus_search_attempts += 1
+        if self._focus_search_attempts < 12:
+            QTimer.singleShot(250, self._focus_search_when_ready)
+
+    def _report_options_progress(self, label: str | None, value: int | None = None) -> None:
+        if label:
+            self.progress_host.set_operation(
+                "options-java",
+                label,
+                None if value is None else value * 10,
+                cancelable=False,
+                priority=60,
+            )
+        else:
+            self.progress_host.set_operation("options-java", None)
 
     def navigate(self, page: str) -> None:
         if self._closing or not self._home_ready:
@@ -495,9 +552,14 @@ class QtLauncherWindow(FramelessWindow):
         if page == "home" or getattr(self, "_" + attribute) is not None or attribute in self._prepared_modules:
             if page == "home":
                 self._refresh_home_account()
+            existed = page == "home" or getattr(self, "_" + attribute, None) is not None
             target_widget = getattr(self, attribute)
             self.pages.setCurrentWidget(target_widget)
-            self._reveal.reveal(target_widget)
+            if existed:
+                self._reveal.reveal(target_widget)
+            else:
+                # A page built on first navigation is shown settled, not animated.
+                self._reveal.stop()
             return
         if self._loading_page is None:
             self._loading_page = QWidget()
@@ -535,8 +597,11 @@ class QtLauncherWindow(FramelessWindow):
                         subpage = self._pending_options_subpage
                         self._pending_options_subpage = None
                         target_widget.show_subpage(subpage, animate=False)
+                    # First appearance: show the settled page instead of animating content
+                    # that is about to change (skin state, mod reload, settings cards), which
+                    # would be cancelled mid-wave and snap into place.
+                    self._reveal.stop()
                     self.pages.setCurrentWidget(target_widget)
-                    self._reveal.reveal(target_widget)
                 except Exception as error:
                     failed(error)
 
@@ -614,17 +679,18 @@ class QtLauncherWindow(FramelessWindow):
     def _cancel_launch(self) -> None:
         if self._launch_cancel is not None:
             self._launch_cancel.set()
-        if self._launch_token is not None:
+        if self._launch_token is not None or self._game_running:
             self.services.cancel(self._launch_token)
             self._launch_token = None
         self.home.set_operation(None)
+        self.home.set_running(False)
         self.home.show_notice("Launch cancelled.")
 
     def _launch_profile(self, profile_id: str) -> None:
         if self.updater is not None and self.updater.applying:
             self.notify("Wait for the launcher update to finish before launching Minecraft.", "warning", "Updates")
             return
-        if self._launch_token is not None:
+        if self._launch_token is not None or self._game_running:
             return
         raw = self._raw_profiles.get(profile_id)
         if raw is None:
@@ -688,8 +754,19 @@ class QtLauncherWindow(FramelessWindow):
             self._launch_cancel = None
             self.home.set_operation(None)
             process, log_file = result
+            self._game_running = True
+            self.home.set_running(True)
             profile_name = str(raw.get("name") or "Minecraft")
             self.home.show_notice(f"Started {profile_name}.")
+            profile_id = str(raw.get("id", ""))
+            self.home.update_played(profile_id, time.time())
+
+            def _mark_played() -> bool:
+                from wisc.core.storage import mark_profile_played
+
+                return mark_profile_played(profile_id)
+
+            self.services.submit(_mark_played, lambda _result: None, lambda _error: None)
             if self._logs_window is not None:
                 self._logs_window.set_running(True)
             if self.presence is not None:
@@ -740,6 +817,7 @@ class QtLauncherWindow(FramelessWindow):
             self._launch_token = None
             self._launch_cancel = None
             self.home.set_operation(None)
+            self.home.set_running(False)
             if self.presence is not None:
                 self.presence.game_finished()
             self.home.show_notice(str(error) or "Launch failed.")
@@ -803,12 +881,17 @@ class QtLauncherWindow(FramelessWindow):
     def _open_create_profile(self) -> None:
         self._profile_return_page = self._current_page
         self.background.set_frosted(True)
+        appeared = self._profile_editor is not None
         self.profile_editor.open_profile(
             None,
             existing_profiles=list(self._raw_profiles.values()),
         )
         self.pages.setCurrentWidget(self.profile_editor)
-        self._reveal.reveal(self.profile_editor)
+        if appeared:
+            self._reveal.reveal(self.profile_editor)
+        else:
+            # The editor repopulates versions and choices right after it appears.
+            self._reveal.stop()
 
     def _open_edit_profile(self, profile_id: str) -> None:
         raw = self._raw_profiles.get(profile_id)
@@ -817,12 +900,16 @@ class QtLauncherWindow(FramelessWindow):
             return
         self._profile_return_page = self._current_page
         self.background.set_frosted(True)
+        appeared = self._profile_editor is not None
         self.profile_editor.open_profile(
             raw,
             existing_profiles=list(self._raw_profiles.values()),
         )
         self.pages.setCurrentWidget(self.profile_editor)
-        self._reveal.reveal(self.profile_editor)
+        if appeared:
+            self._reveal.reveal(self.profile_editor)
+        else:
+            self._reveal.stop()
 
     def _close_profile_editor(self) -> None:
         target = self._profile_return_page or "home"

@@ -12,7 +12,7 @@ from PyQt6.QtCore import QRectF, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QButtonGroup, QFileDialog, QHBoxLayout,
-    QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QPushButton, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from wisc.core.credentials import redact_credentials
@@ -159,6 +159,7 @@ class ModsPage(QWidget):
         self._details = None
         self._detail_item: ContentItem | None = None
         self._detail_loaded = False
+        self._details_shown = False
         self._profile_task = LatestServiceTask(runner)
         self._context_task = LatestServiceTask(runner)
         self._scan_task = LatestServiceTask(runner)
@@ -342,12 +343,21 @@ class ModsPage(QWidget):
         self.empty_retry.setFixedHeight(theme.BUTTON_HEIGHT)
         self.empty_retry.clicked.connect(self.refresh)
         empty.addWidget(self.empty_retry, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.empty_clear = GlassButton("Clear search")
+        self.empty_clear.setFixedHeight(theme.BUTTON_HEIGHT)
+        self.empty_clear.clicked.connect(self._clear_search)
+        self.empty_clear.hide()
+        empty.addWidget(self.empty_clear, 0, Qt.AlignmentFlag.AlignHCenter)
         empty.addStretch()
         self.results.addWidget(self.empty)
         listing.addWidget(self.results, 1)
         self.body.addWidget(self.listing)
         self.notice_host = QWidget()
         self.notice_host.setFixedHeight(theme.SEGMENT_HEIGHT)
+        # Keep the notice strip's height reserved so transient messages never resize the list.
+        notice_policy = self.notice_host.sizePolicy()
+        notice_policy.setRetainSizeWhenHidden(True)
+        self.notice_host.setSizePolicy(notice_policy)
         notice = QHBoxLayout(self.notice_host)
         notice.setContentsMargins(0, 0, 0, 0)
         self.notice = ElidedLabel()
@@ -850,6 +860,8 @@ class ModsPage(QWidget):
         self.empty_note.setText(note)
         self.empty_retry.setVisible(not self._loading and not self._loading_profiles and not self._scanning)
         self.empty_retry.setEnabled(not locked)
+        self.empty_clear.setVisible(bool(self.search.text().strip()) and browse)
+        self.empty_clear.setEnabled(not locked)
         self.pagination.display(self.browse_state.offset, self.browse_state.total if browse else 0,
                                 busy=self._loading or locked)
         self.loading_changed.emit(self._active and (self._loading or self._scanning or self._loading_profiles or self._checking))
@@ -886,6 +898,19 @@ class ModsPage(QWidget):
         if message:
             self._notice_timer.start(15000 if self._undo else 8000)
 
+    def focus_search(self) -> None:
+        """Focus the content search field (Ctrl+F)."""
+        self.search.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search.selectAll()
+
+    def _clear_search(self) -> None:
+        self.search.clear()
+        if self.view == "browse":
+            self.browse_state.offset = 0
+            self._submit_search()
+        else:
+            self._render()
+
     def _open_link(self, url: str) -> None:
         target = QUrl(url)
         if target.scheme() in {"http", "https"} and not QDesktopServices.openUrl(target):
@@ -901,8 +926,14 @@ class ModsPage(QWidget):
         self.details.open(item, self.kind, self.profile)
         self.details.set_release(self._release)
         self.body.setCurrentWidget(self.details)
-        self._reveal.reveal(self.details)
         self._render()
+        # The details page finishes loading right after it appears, so only a returning
+        # visit is animated; a first-open wave would be cancelled and snap into place.
+        if self._details_shown:
+            self._reveal.reveal(self.details)
+        else:
+            self._reveal.stop()
+        self._details_shown = True
         self._load_details()
 
     def close_details(self) -> None:
@@ -913,8 +944,8 @@ class ModsPage(QWidget):
         self._detail_item = None
         self._detail_loaded = False
         self.body.setCurrentWidget(self.listing)
-        self._reveal.reveal(self.listing)
         self._render()
+        self._reveal.reveal(self.listing)
 
     def _details_payload(self, item: ContentItem, profile: dict, kind: str, manager: ModManager | None,
                          release: str) -> dict:

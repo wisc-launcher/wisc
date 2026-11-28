@@ -14,16 +14,22 @@ from PyQt6.QtWidgets import (
 from wisc.core.credentials import redact_credentials
 from wisc.core.paths import ASSETS_DIR
 from wisc.ui import theme as theme
-from wisc.ui.components import GlassButton, GlassPanel, text_label
+from wisc.ui.components import GlassButton, GlassLineEdit, GlassPanel, text_label
 from wisc.ui.skins import StatusDot
 from wisc.ui.theme import MUTED, TEXT
 
 MAX_LOG_LINES = 2000
+ERROR_TOKENS = ("error", "exception", "fatal", "crash")
+
+
+def _is_error(line: str) -> bool:
+    low = line.lower()
+    return any(token in low for token in ERROR_TOKENS)
 
 
 def _line_color(line: str) -> str:
     low = line.lower()
-    if any(token in low for token in ("error", "exception", "fatal", "crash")):
+    if _is_error(line):
         return "#ef5350"
     if "warn" in low:
         return "#ffca28"
@@ -45,6 +51,7 @@ class GameLogsWindow(QWidget):
         self._accent = accent
         self._on_notify = on_notify
         self._buffer: deque[str] = deque(maxlen=MAX_LOG_LINES)
+        self._error_blocks: list[int] = []
         self._running = False
         self._auto_scroll = True
 
@@ -109,6 +116,31 @@ class GameLogsWindow(QWidget):
         header.addWidget(close_btn)
         panel_layout.addWidget(self._header)
 
+        filters = QHBoxLayout()
+        filters.setContentsMargins(0, 0, 0, 0)
+        filters.setSpacing(8)
+        self._filter = GlassLineEdit(search_icon=True)
+        self._filter.setPlaceholderText("Filter logs")
+        self._filter.setAccessibleName("Filter logs")
+        self._filter.setClearButtonEnabled(True)
+        self._filter.setFixedHeight(theme.COMPACT_HEIGHT)
+        self._filter.textChanged.connect(lambda _text: self._render())
+        filters.addWidget(self._filter, 1)
+        self._errors_btn = GlassButton("Errors")
+        self._errors_btn.setCheckable(True)
+        self._errors_btn.setToolTip("Show error lines only")
+        self._errors_btn.setFixedHeight(theme.COMPACT_HEIGHT)
+        self._errors_btn.toggled.connect(lambda _on: self._render())
+        filters.addWidget(self._errors_btn)
+        self._jump_btn = GlassButton("First error")
+        self._jump_btn.setFixedHeight(theme.COMPACT_HEIGHT)
+        self._jump_btn.clicked.connect(self.jump_to_first_error)
+        filters.addWidget(self._jump_btn)
+        self._count_label = text_label("", theme.FONT_DETAIL, muted=True)
+        self._count_label.setMinimumWidth(170)
+        filters.addWidget(self._count_label)
+        panel_layout.addLayout(filters)
+
         self._editor = QPlainTextEdit()
         self._editor.setReadOnly(True)
         self._editor.setMaximumBlockCount(MAX_LOG_LINES)
@@ -129,6 +161,7 @@ class GameLogsWindow(QWidget):
         root.addWidget(panel)
 
         self._drag_offset = None
+        self._update_count()
         self.set_running(False)
 
     def mousePressEvent(self, event) -> None:
@@ -175,6 +208,63 @@ class GameLogsWindow(QWidget):
         self._status_dot.set_color(self._accent if running else MUTED)
         self._status_label.setText("Running" if running else "Idle")
 
+    # ── Filtering ───────────────────────────────────────────────────────────
+
+    def _matches(self, line: str) -> bool:
+        if self._errors_btn.isChecked() and not _is_error(line):
+            return False
+        query = self._filter.text().strip().casefold()
+        if not query:
+            return True
+        return query in line.casefold()
+
+    def _insert_line(self, line: str) -> None:
+        cursor = self._editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self._editor.toPlainText():
+            cursor.insertText("\n")
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(_line_color(line)))
+        cursor.insertText(line, fmt)
+
+    def _render(self) -> None:
+        self._editor.clear()
+        self._error_blocks.clear()
+        block = -1
+        for line in self._buffer:
+            if not self._matches(line):
+                continue
+            self._insert_line(line)
+            block += 1
+            if _is_error(line):
+                self._error_blocks.append(block)
+        self._update_count()
+        if self._auto_scroll:
+            bar = self._editor.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+    def _update_count(self) -> None:
+        errors = sum(1 for line in self._buffer if _is_error(line))
+        parts = [f"{len(self._buffer)} lines", f"{errors} error{'s' if errors != 1 else ''}"]
+        if self._filter.text().strip() or self._errors_btn.isChecked():
+            shown = sum(1 for line in self._buffer if self._matches(line))
+            parts.append(f"{shown} shown")
+        self._count_label.setText(" \u00b7 ".join(parts))
+
+    def jump_to_first_error(self) -> None:
+        if not self._error_blocks:
+            if self._on_notify:
+                self._on_notify("This log has no error lines.", "info", "Logs")
+            return
+        block = self._editor.document().findBlockByNumber(self._error_blocks[0])
+        if not block.isValid():
+            return
+        cursor = QTextCursor(block)
+        self._editor.setTextCursor(cursor)
+        self._editor.centerCursor()
+
+    # ── Content ─────────────────────────────────────────────────────────────
+
     def append_line(self, line: str, sensitive_values: tuple[str, ...] = ()) -> None:
         cleaned = redact_credentials(str(line).rstrip("\r\n"), sensitive_values)
         if not cleaned:
@@ -182,15 +272,13 @@ class GameLogsWindow(QWidget):
         self._buffer.append(cleaned)
         bar = self._editor.verticalScrollBar()
         at_bottom = self._auto_scroll or bar.value() >= bar.maximum() - 4
-        cursor = self._editor.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(_line_color(cleaned)))
-        if self._editor.document().blockCount() > 1 or self._editor.toPlainText():
-            cursor.insertText("\n")
-        cursor.insertText(cleaned, fmt)
-        if at_bottom:
-            bar.setValue(bar.maximum())
+        if self._matches(cleaned):
+            self._insert_line(cleaned)
+            if _is_error(cleaned):
+                self._error_blocks.append(self._editor.document().blockCount() - 1)
+            if at_bottom:
+                bar.setValue(bar.maximum())
+        self._update_count()
 
     def copy_logs(self) -> None:
         if not self._buffer:
@@ -205,7 +293,9 @@ class GameLogsWindow(QWidget):
 
     def clear_logs(self) -> None:
         self._buffer.clear()
+        self._error_blocks.clear()
         self._editor.clear()
+        self._update_count()
         if self._on_notify:
             self._on_notify("The log view has been cleared.", "info", "Logs cleared")
 

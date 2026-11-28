@@ -15,6 +15,7 @@ from pathlib import Path
 import requests
 import minecraft_launcher_lib
 from wisc.services import auth as ely_auth
+from wisc.services import java as java_runtimes
 from wisc.services.profiles import has_pending_pack
 from wisc.core.storage import (
 	load_pending_installations,
@@ -975,6 +976,64 @@ def prepare_launch_profile(profile, installed_versions):
 	return target
 
 
+def resolve_java_executable(
+	target,
+	minecraft_dir,
+	settings,
+	callback,
+	cancel_event,
+	online_available,
+) -> str | None:
+	"""Pick or install the Java runtime for this profile.
+
+	Returns an executable to force, or None so the launcher library uses the
+	managed runtime it resolves from the version's Java component.
+	"""
+	manual = str((settings or {}).get("java_path", "")).strip()
+	component, major = java_runtimes.runtime_for_version(str(target.get("version_id") or ""), minecraft_dir)
+	if not major:
+		minecraft_version = str(target.get("minecraft_version") or "")
+		if minecraft_version:
+			component, major = java_runtimes.runtime_for_version(minecraft_version, minecraft_dir)
+	if manual:
+		selected_major = java_runtimes.java_major(manual)
+		if major and selected_major and selected_major != major:
+			raise ValueError(
+				f"This version needs Java {major}, but the selected Java is version {selected_major}. "
+				f"Choose Use Automatic in Options > Java, or select a Java {major} installation."
+			)
+		return manual
+	if not component:
+		return None
+	if java_runtimes.runtime_executable(component, minecraft_dir):
+		return None
+	status = (callback or {}).get("setStatus", lambda *_: None)
+	if online_available:
+		status(f"Downloading Java {major}...")
+		try:
+			installed = java_runtimes.ensure_runtime(
+				component,
+				minecraft_dir,
+				callback=callback,
+				cancel_event=cancel_event,
+			)
+		except java_runtimes.RuntimeDownloadCancelled as error:
+			raise DownloadCancelled(str(error)) from error
+		if not installed:
+			raise RuntimeError(
+				f"Java {major} could not be installed for this version. "
+				f"Install Java {major} and select it in Options > Java."
+			)
+		return None
+	for candidate in detect_java_installations(minecraft_dir):
+		if java_runtimes.java_major(candidate) == major:
+			return candidate
+	raise RuntimeError(
+		f"Java {major} is required for this version and is not installed. "
+		f"Reconnect to download it, or install Java {major} and select it in Options > Java."
+	)
+
+
 async def start_game(
 	target,
 	username: str,
@@ -1158,9 +1217,11 @@ async def start_game(
 			launch_options["jvmArguments"].extend(shlex.split(profile_jvm))
 		except Exception:
 			launch_options["jvmArguments"].extend(profile_jvm.split())
-	java_path = str((settings or {}).get("java_path", "")).strip()
-	if java_path:
-		launch_options["executablePath"] = java_path
+	java_executable = resolve_java_executable(
+		target, minecraft_directory, settings, callback, cancel_event, online_available
+	)
+	if java_executable:
+		launch_options["executablePath"] = java_executable
 	command = await asyncio.to_thread(
 		minecraft_launcher_lib.command.get_minecraft_command,
 		version_id,
