@@ -91,6 +91,8 @@ THEME_FILE = DATA_DIR / "theme.txt"
 DEFAULT_SETTINGS: dict[str, object] = {
     "ram_mb": 4096,
     "java_path": "",
+    "jvm_preset": "Default",
+    "jvm_arguments": "",
     "window_width": 854,
     "window_height": 480,
     "fullscreen": False,

@@ -24,8 +24,8 @@ from PyQt6.QtWidgets import (
 from wisc.mods.markdown import normalize_mod_markdown
 from wisc.ui import theme as theme
 from wisc.ui.components import (
-    REVEAL_TOTAL_MS, GlassButton, GlassMenu, compose_profile_surface, enable_smooth_scroll, paint_glass,
-    paint_profile_actions, paint_profile_caption, paint_switch,
+    REVEAL_TOTAL_MS, GlassButton, GlassMenu, build_profile_actions_menu, compose_profile_surface,
+    enable_smooth_scroll, paint_glass, paint_profile_actions, paint_profile_caption, paint_switch,
     reveal_wave_sample, reveal_wave_window, text_label,
 )
 from wisc.ui.images import ContentImages
@@ -539,11 +539,12 @@ class ProfileGrid(ContentList):
             self._show_actions(item, self.viewport().mapToGlobal(self.visualRect(index).topRight() + QPoint(-10, 40)))
 
     def _show_actions(self, item: ContentItem, position: QPoint) -> None:
-        menu = GlassMenu(self)
-        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        for key, label in (("home", "Open on Home"), ("play", "Play" if item.payload.installed else "Install && Play"),
-                           ("edit", "Edit"), ("folder", "Folder"), ("mods", "Mods")):
-            menu.addAction(label, lambda checked=False, action=key: self.action_requested.emit(item, action))
+        menu = build_profile_actions_menu(
+            self,
+            installed=bool(item.payload.installed),
+            include_open_home=True,
+            on_action=lambda action: self.action_requested.emit(item, action),
+        )
         menu.popup(position)
 
     def contextMenuEvent(self, event) -> None:

@@ -15,7 +15,7 @@ from wisc.core.paths import ASSETS_DIR
 from wisc.ui import theme as theme
 from wisc.ui.components import (
     ElidedLabel, GlassButton, LauncherComboBox, ProfileCard,
-    artwork_image, text_label,
+    artwork_image, build_profile_actions_menu, text_label,
 )
 from wisc.ui.images import ContentImages
 from wisc.ui.theme import ui_font
@@ -39,6 +39,7 @@ class HomePage(QWidget):
     operation_changed = pyqtSignal(object, object)
     edit_requested = pyqtSignal(str)
     folder_requested = pyqtSignal(str)
+    action_requested = pyqtSignal(str, str)
     create_requested = pyqtSignal()
     library_requested = pyqtSignal()
     logs_requested = pyqtSignal()
@@ -115,7 +116,8 @@ class HomePage(QWidget):
         shelf_heading.setSpacing(10)
         shelf_heading.addWidget(text_label("Library", theme.FONT_SHELF_HEADING, bold=True))
         count = len(profiles)
-        shelf_heading.addWidget(text_label(f"{count} profile{'s' if count != 1 else ''}", theme.FONT_DETAIL, muted=True))
+        self._shelf_count = text_label(f"{count} profile{'s' if count != 1 else ''}", theme.FONT_DETAIL, muted=True)
+        shelf_heading.addWidget(self._shelf_count)
         shelf_heading.addStretch(1)
         view_all = QPushButton("View all  \u2192")
         view_all.setObjectName("quiet")
@@ -179,6 +181,33 @@ class HomePage(QWidget):
             24, 24, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation,
         )))
 
+    def set_profiles(self, profiles: Sequence[HomeProfile], selected_id: str | None = None) -> None:
+        if len({profile.id for profile in profiles}) != len(profiles):
+            raise ValueError("Home profile IDs must be unique.")
+        self._profiles = list(profiles)
+        self._profiles_by_id = {profile.id: profile for profile in profiles}
+        for card in self._cards.values():
+            self._shelf.removeWidget(card)
+            card.hide()
+            card.deleteLater()
+        self._cards.clear()
+        count = len(self._profiles)
+        self._shelf_count.setText(f"{count} profile{'s' if count != 1 else ''}")
+        if self._profiles:
+            target_id = selected_id if selected_id in self._profiles_by_id else (
+                self._selected.id if self._selected and self._selected.id in self._profiles_by_id
+                else self._profiles[0].id
+            )
+            self._selected = None
+            self.select_profile(target_id)
+        else:
+            self._selected = None
+            self.title.setText("No profiles")
+            self.details.setText("")
+            self._refresh_actions()
+            self._refresh_shelf()
+            self._restore_status()
+
     def select_profile(self, profile_id: str) -> None:
         if self._busy:
             return
@@ -188,8 +217,6 @@ class HomePage(QWidget):
         self._selected = profile
         self.title.setText(profile.name)
         self.details.setText(f"{profile.version}  \u00b7  {profile.loader}")
-        for key, card in self._cards.items():
-            card.setChecked(key == profile.id)
         self._notice.stop()
         self._refresh_actions()
         self._refresh_shelf()
@@ -257,8 +284,16 @@ class HomePage(QWidget):
                 card = ProfileCard(profile.name, f"{profile.version} \u00b7 {profile.loader}",
                                    profile.artwork, profile.icon, self._accent, images=self._images)
                 card.clicked.connect(lambda checked=False, identity=key: self.select_profile(identity))
+                menu = build_profile_actions_menu(
+                    card,
+                    installed=profile.installed,
+                    include_open_home=False,
+                    on_action=lambda action, identity=key: self.action_requested.emit(identity, action),
+                )
+                card.set_actions_menu(menu)
                 self._cards[key] = card
-            self._shelf.insertWidget(index, card, 1)
+            if self._shelf.indexOf(card) != index:
+                self._shelf.insertWidget(index, card, 1)
             card.setChecked(self._selected is not None and key == self._selected.id)
             card.setEnabled(not self._busy)
             card.show()

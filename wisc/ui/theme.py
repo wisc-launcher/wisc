@@ -70,8 +70,9 @@ SELECTOR_OPEN_OPACITY = 0.10
 ROW_HOVER_OPACITY = SELECTOR_HOVER_OPACITY = 0.06
 DISABLED_CARD_OPACITY = 0.55
 ARTWORK_BLUR_RADIUS = 18
-VIGNETTE_HORIZONTAL = ((0, 240), (0.32, 185), (0.62, 40), (0.85, 25), (1, 130))
-VIGNETTE_VERTICAL = ((0, 0), (0.25, 0), (0.65, 45), (1, 245))
+ARTWORK_BLUR_LIMIT = 1200
+VIGNETTE_HORIZONTAL = ((0, 199), (0.16, 97), (0.34, 20), (0.50, 0), (0.66, 20), (0.84, 97), (1, 199))
+VIGNETTE_VERTICAL = ((0, 158), (0.18, 46), (0.38, 0), (0.54, 0), (0.76, 77), (1, 209))
 FEATURE_VIGNETTE_STRENGTH = 0.60
 BUTTON_FOCUS_FILL = (255, 255, 255, 14)
 SWITCH_ON_ALPHA = 100
@@ -173,6 +174,8 @@ def _font_template(base: str, size: int, bold: bool, pixel: bool) -> QFont:
 
 def install_fonts() -> None:
     QFontDatabase.addApplicationFont(str(ASSETS_DIR / "fonts" / "PixelifySans.ttf"))
+    QFontDatabase.addApplicationFont(str(ASSETS_DIR / "fonts" / "ClashDisplay-Variable.ttf"))
+    QFontDatabase.addApplicationFont(str(ASSETS_DIR / "fonts" / "Outfit-Variable.ttf"))
     font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
     if sys.platform == "win32":
         font.setFamily(WINDOWS_FONT_FAMILY)

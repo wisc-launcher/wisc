@@ -64,10 +64,10 @@ def _read_image(source: str | bytes, limit: int) -> QImage:
 
 
 class ImageStore(QObject):
-    """One application cache and four decode slots shared by all page consumers."""
+    """One application cache and two decode slots shared by all page consumers."""
 
     ready = pyqtSignal(str)
-    MAX_BYTES = 32 * 1024 * 1024
+    MAX_BYTES = 24 * 1024 * 1024
 
     def __init__(self, runner: ServiceRunner):
         super().__init__(runner)
@@ -78,6 +78,7 @@ class ImageStore(QObject):
         self.queue: deque[str] = deque()
         self.active = 0
         self.bytes = 0
+        self.fallback = asset_icon(ASSETS_DIR / 'tab-icons' / 'mods.svg').pixmap(QSize(128, 128))
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._pump)
@@ -107,7 +108,7 @@ class ImageStore(QObject):
             self.queue.clear()
             self.requests.clear()
             return
-        while self.active < 4 and self.queue:
+        while self.active < 2 and self.queue:
             key = self.queue.popleft()
             source, limit, blur, clients = self.requests[key]
             if not clients:
@@ -135,7 +136,7 @@ class ImageStore(QObject):
                 self.bytes -= old.width() * old.height() * 4
             self.cache[key] = pixmap
             self.bytes += pixmap.width() * pixmap.height() * 4
-            while self.bytes > self.MAX_BYTES or len(self.cache) > 128:
+            while self.bytes > self.MAX_BYTES or len(self.cache) > 96:
                 _, old = self.cache.popitem(last=False)
                 self.bytes -= old.width() * old.height() * 4
         self.ready.emit(key)
@@ -144,8 +145,8 @@ class ImageStore(QObject):
 
 def _read_blurred_image(source: str | bytes, limit: int) -> QImage:
     from PIL import Image, ImageFilter
-    from wisc.ui.theme import ARTWORK_BLUR_RADIUS
-    image = _read_image(source, min(limit, 1200)).convertToFormat(QImage.Format.Format_RGBA8888)
+    from wisc.ui.theme import ARTWORK_BLUR_LIMIT, ARTWORK_BLUR_RADIUS
+    image = _read_image(source, min(limit, ARTWORK_BLUR_LIMIT)).convertToFormat(QImage.Format.Format_RGBA8888)
     if image.isNull():
         return image
     pixels = image.constBits().asstring(image.sizeInBytes())
@@ -172,7 +173,7 @@ class ContentImages(QObject):
         self._deferred: set[str] = set()
         self._visible = False
         store.ready.connect(self._finished)
-        self.fallback = asset_icon(ASSETS_DIR / 'tab-icons' / 'mods.svg').pixmap(QSize(128, 128))
+        self.fallback = store.fallback
 
     @staticmethod
     def key(source: str | bytes, limit: int = 128, *, blur: bool = False) -> str:
@@ -197,6 +198,9 @@ class ContentImages(QObject):
         else:
             self._store.suspend(self)
 
+    def has_failed(self, key: str) -> bool:
+        return self._store.failed.get(key, 0) > monotonic()
+
     def get(self, source: str | bytes | None, limit: int = 128, *, blur: bool = False) -> QPixmap | None:
         if not source:
             return None
@@ -205,7 +209,7 @@ class ContentImages(QObject):
         if cached is not None:
             self._cache.move_to_end(key)
             return cached
-        if self._visible and key not in self._pending and self._store.failed.get(key, 0) <= monotonic():
+        if self._visible and key not in self._pending and not self.has_failed(key):
             self._store.request(self, key, source, limit, blur)
         return None
 

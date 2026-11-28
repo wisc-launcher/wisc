@@ -104,6 +104,22 @@ class LibraryPage(QWidget):
         self.scroll.selected_id = profile_id
         self.scroll.viewport().update()
 
+    def set_profiles(self, profiles: Sequence[HomeProfile], selected_id: str | None = None) -> None:
+        self._profiles = list(profiles)
+        current_loader = self.loader_filter.currentText()
+        self.loader_filter.blockSignals(True)
+        self.loader_filter.clear()
+        self.loader_filter.addItem("All loaders")
+        self.loader_filter.addItems(sorted({profile.loader for profile in profiles}))
+        if self.loader_filter.findText(current_loader) >= 0:
+            self.loader_filter.setCurrentText(current_loader)
+        self.loader_filter.blockSignals(False)
+        if selected_id is not None:
+            self._selected_id = selected_id
+            self.scroll.selected_id = selected_id
+        self._layout_signature = None
+        self._reflow()
+
     def apply_theme(self, colors: dict[str, str]) -> None:
         self.scroll.set_accent(colors["btn_primary"], colors["btn_primary_text"])
 

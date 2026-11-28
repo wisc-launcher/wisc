@@ -9,8 +9,8 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QByteArray, QRectF, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter
+from PyQt6.QtCore import QByteArray, QRectF, QSize, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QPainter
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QAbstractButton,
@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QScrollArea,
     QSlider,
     QStackedWidget,
@@ -290,6 +291,140 @@ class _GlassInputDialog(QDialog):
         return dialog.value(), accepted
 
 
+class _ElyLoginDialog(QDialog):
+    """Frameless frosted-glass Ely.by sign-in dialog with 2FA support."""
+
+    def __init__(
+        self,
+        runner: ServiceRunner,
+        *,
+        login_hint: str = "",
+        title: str = "Sign in with Ely.by",
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._runner = runner
+        self._token: int | None = None
+        self._result: dict | None = None
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMinimumWidth(400)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        panel = GlassPanel(radius=theme.RADIUS_PANEL)
+        outer.addWidget(panel)
+
+        body = QVBoxLayout(panel)
+        body.setContentsMargins(24, 22, 24, 22)
+        body.setSpacing(12)
+        body.addWidget(text_label(title, theme.FONT_DIALOG_TITLE, bold=True))
+        body.addWidget(
+            text_label(
+                "Sign in with your Ely.by username or email to sync skins and play online.",
+                theme.FONT_BODY,
+                muted=True,
+            )
+        )
+
+        self._login_input = GlassLineEdit()
+        self._login_input.setPlaceholderText("Username or email")
+        if login_hint:
+            self._login_input.setText(login_hint)
+        body.addWidget(self._login_input)
+
+        self._password_input = GlassLineEdit()
+        self._password_input.setPlaceholderText("Password")
+        self._password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._password_input.returnPressed.connect(self._submit)
+        body.addWidget(self._password_input)
+
+        self._totp_input = GlassLineEdit()
+        self._totp_input.setPlaceholderText("2FA code (6 digits)")
+        self._totp_input.returnPressed.connect(self._submit)
+        self._totp_input.hide()
+        body.addWidget(self._totp_input)
+
+        self._error_label = text_label("", theme.FONT_DETAIL)
+        self._error_label.setStyleSheet("color: #fc8181;")
+        self._error_label.setWordWrap(True)
+        self._error_label.hide()
+        body.addWidget(self._error_label)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        register_btn = GlassButton("Register")
+        register_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        register_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://account.ely.by/register"))
+        )
+        actions.addWidget(register_btn)
+        actions.addStretch(1)
+
+        self._cancel_btn = GlassButton("Cancel")
+        self._cancel_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._cancel_btn.clicked.connect(self._cancel)
+        actions.addWidget(self._cancel_btn)
+
+        self._sign_in_btn = GlassButton("Sign In", accented=True)
+        self._sign_in_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._sign_in_btn.clicked.connect(self._submit)
+        actions.addWidget(self._sign_in_btn)
+        body.addLayout(actions)
+
+    @property
+    def auth_result(self) -> dict | None:
+        return self._result
+
+    def _set_busy(self, busy: bool) -> None:
+        self._login_input.setEnabled(not busy)
+        self._password_input.setEnabled(not busy)
+        self._totp_input.setEnabled(not busy)
+        self._sign_in_btn.setEnabled(not busy)
+        self._sign_in_btn.setText("Signing in..." if busy else "Sign In")
+
+    def _submit(self) -> None:
+        if self._token is not None:
+            return
+        login = self._login_input.text().strip()
+        password = self._password_input.text()
+        totp = self._totp_input.text().strip() or None
+        if not login or not password:
+            self._error_label.setText("Enter your Ely.by username/email and password.")
+            self._error_label.show()
+            return
+        self._error_label.hide()
+        self._set_busy(True)
+
+        from wisc.services import auth as ely_auth
+
+        def run_auth():
+            return ely_auth.authenticate(login, password, totp_code=totp)
+
+        def on_done(result: dict) -> None:
+            self._token = None
+            self._set_busy(False)
+            self._result = {**result, "email": login}
+            self.accept()
+
+        def on_fail(error: Exception) -> None:
+            self._token = None
+            self._set_busy(False)
+            if isinstance(error, ely_auth.Ely2FARequiredError):
+                self._totp_input.show()
+                self._totp_input.setFocus()
+            self._error_label.setText(str(error) or "Sign-in failed.")
+            self._error_label.show()
+
+        self._token = self._runner.submit(run_auth, on_done, on_fail)
+
+    def _cancel(self) -> None:
+        if self._token is not None:
+            self._runner.cancel(self._token)
+            self._token = None
+        self.reject()
+
+
 def _setting_row(
     title: str,
     description: str,
@@ -343,17 +478,27 @@ class OptionsPage(QWidget):
 
     theme_requested = pyqtSignal(str)
     settings_changed = pyqtSignal(dict)
+    accounts_changed = pyqtSignal()
 
-    def __init__(self, runner: ServiceRunner, colors: dict[str, str], parent: QWidget | None = None):
+    def __init__(
+        self,
+        runner: ServiceRunner,
+        colors: dict[str, str],
+        parent: QWidget | None = None,
+        *,
+        updater=None,
+    ):
         super().__init__(parent)
         self.runner = runner
         self._colors = colors
+        self._updater = updater
         self._settings = load_settings()
-        self._max_ram = _system_memory_mb()
         self._cards: list[OptionCard] = []
         self._switches: list[GlassSwitch] = []
         self._update_check_token: int | None = None
         self._reveal = StaggeredReveal(self)
+        if self._updater is not None:
+            self._updater.state_changed.connect(self._on_updater_state_changed)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(*theme.PAGE_MARGINS)
@@ -364,17 +509,22 @@ class OptionsPage(QWidget):
 
         self._subpages: dict[str, QWidget] = {}
         self._build_dashboard()
-        self._build_appearance_page()
-        self._build_java_page()
-        self._build_game_page()
-        self._build_accounts_page()
-        self._build_launcher_page()
-        self._build_about_page()
         self.show_subpage("options", animate=False)
 
     def show_subpage(self, key: str, *, animate: bool = True) -> None:
         if key == "options_updates":
             key = "options_about"
+        if key not in self._subpages:
+            build_page = {
+                "options_ui": self._build_appearance_page,
+                "options_java": self._build_java_page,
+                "options_game": self._build_game_page,
+                "options_accounts": self._build_accounts_page,
+                "options_launcher": self._build_launcher_page,
+                "options_about": self._build_about_page,
+            }.get(key)
+            if build_page is not None:
+                build_page()
         widget = self._subpages.get(key) or self._subpages["options"]
         if key == "options_accounts":
             self._refresh_accounts_list()
@@ -532,10 +682,16 @@ class OptionsPage(QWidget):
 
     # ── Java & Memory ───────────────────────────────────────────────────────
     def _build_java_page(self) -> None:
+        from wisc.services.launcher import JVM_OPTIMIZATION_PRESETS
+
+        self._max_ram = _system_memory_mb()
         content = self._build_subpage_shell(
             "options_java",
             "Java & Memory",
-            lambda: self._reset_fields(("ram_mb", "java_path"), self._sync_java_fields),
+            lambda: self._reset_fields(
+                ("ram_mb", "java_path", "jvm_preset", "jvm_arguments"),
+                self._sync_java_fields,
+            ),
         )
 
         ram_row = QWidget()
@@ -569,20 +725,51 @@ class OptionsPage(QWidget):
         java_layout.setContentsMargins(0, 0, 0, 0)
         java_layout.setSpacing(8)
         self._java_input = GlassLineEdit()
-        self._java_input.setMinimumWidth(260)
+        self._java_input.setMinimumWidth(220)
         self._java_input.setPlaceholderText("System Java (automatic)")
         self._java_input.textChanged.connect(lambda text: self._persist("java_path", text.strip()))
+        self._detect_java_btn = GlassButton("Auto-Detect")
+        self._detect_java_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._detect_java_btn.clicked.connect(self._auto_detect_java)
         browse_btn = GlassButton("Browse")
         browse_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
         browse_btn.clicked.connect(self._browse_java)
         java_layout.addWidget(self._java_input, 1)
+        java_layout.addWidget(self._detect_java_btn)
         java_layout.addWidget(browse_btn)
 
         content.addWidget(
             _setting_row(
                 "Java Executable",
-                "Leave empty to use system Java, or select your java.exe.",
+                "Leave empty to use system Java, or select/detect your java.exe.",
                 control=java_row,
+            )
+        )
+
+        self._jvm_preset_combo = LauncherComboBox()
+        self._jvm_preset_combo.setMinimumWidth(220)
+        for preset_name in JVM_OPTIMIZATION_PRESETS:
+            self._jvm_preset_combo.addItem(preset_name, preset_name)
+        self._jvm_preset_combo.currentIndexChanged.connect(
+            lambda: self._persist("jvm_preset", str(self._jvm_preset_combo.currentData() or "Default"))
+        )
+        content.addWidget(
+            _setting_row(
+                "Game Optimization Preset",
+                "Apply tuned garbage collector flags (G1GC / ZGC / Shenandoah) for smoother frame times.",
+                control=self._jvm_preset_combo,
+            )
+        )
+
+        self._jvm_args_input = GlassLineEdit()
+        self._jvm_args_input.setMinimumWidth(260)
+        self._jvm_args_input.setPlaceholderText("e.g. -XX:+UseG1GC -XX:+ParallelRefProcEnabled")
+        self._jvm_args_input.textChanged.connect(lambda text: self._persist("jvm_arguments", text.strip()))
+        content.addWidget(
+            _setting_row(
+                "Global JVM Arguments",
+                "Extra JVM flags applied to all profiles before per-profile arguments.",
+                control=self._jvm_args_input,
             )
         )
         content.addStretch(1)
@@ -598,6 +785,33 @@ class OptionsPage(QWidget):
         self._java_input.blockSignals(True)
         self._java_input.setText(str(self._settings.get("java_path", "")))
         self._java_input.blockSignals(False)
+        preset = str(self._settings.get("jvm_preset", DEFAULT_SETTINGS["jvm_preset"]))
+        idx = self._jvm_preset_combo.findData(preset)
+        if idx >= 0:
+            self._jvm_preset_combo.blockSignals(True)
+            self._jvm_preset_combo.setCurrentIndex(idx)
+            self._jvm_preset_combo.blockSignals(False)
+        self._jvm_args_input.blockSignals(True)
+        self._jvm_args_input.setText(str(self._settings.get("jvm_arguments", "")))
+        self._jvm_args_input.blockSignals(False)
+
+    def _auto_detect_java(self) -> None:
+        from wisc.services.launcher import detect_java_installations
+        from wisc.ui.components import GlassMenu
+
+        found = detect_java_installations(_minecraft_dir())
+        if not found:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Auto-Detect Java", "No Java installations were found automatically.")
+            return
+        if len(found) == 1:
+            self._java_input.setText(found[0])
+            return
+        menu = GlassMenu(self._detect_java_btn)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        for path in found:
+            menu.addAction(path, lambda checked=False, p=path: self._java_input.setText(p))
+        menu.exec(self._detect_java_btn.mapToGlobal(self._detect_java_btn.rect().bottomLeft()))
 
     def _on_ram_slider_changed(self, value: int) -> None:
         snapped = max(256, min(self._max_ram, round(value / 128) * 128))
@@ -693,8 +907,41 @@ class OptionsPage(QWidget):
                 control=self._skins_switch,
             )
         )
+
+        self._prune_status = text_label("", theme.FONT_DETAIL, muted=True)
+        self._prune_btn = GlassButton("Prune Cache")
+        self._prune_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._prune_btn.clicked.connect(self._prune_skin_cache)
+        content.addWidget(
+            _setting_row(
+                "Skin Cache",
+                "Remove old or excess cached Ely.by skin textures from disk.",
+                control=self._prune_btn,
+                extra=self._prune_status,
+            )
+        )
         content.addStretch(1)
         self._sync_game_fields()
+
+    def _prune_skin_cache(self) -> None:
+        from wisc.services import skins
+
+        self._prune_btn.setEnabled(False)
+        self._prune_status.setText("Pruning skin cache...")
+
+        def on_done(count: int) -> None:
+            self._prune_btn.setEnabled(True)
+            self._prune_status.setText(
+                f"Removed {count} old cached file{'s' if count != 1 else ''}."
+                if count
+                else "Skin cache is already clean."
+            )
+
+        def on_fail(err: Exception) -> None:
+            self._prune_btn.setEnabled(True)
+            self._prune_status.setText(f"Could not prune cache: {err}")
+
+        self.runner.submit(skins.prune_skin_cache, on_done, on_fail)
 
     def _sync_game_fields(self) -> None:
         self._width_input.setText(str(self._settings.get("window_width", DEFAULT_SETTINGS["window_width"])))
@@ -717,14 +964,24 @@ class OptionsPage(QWidget):
     def _build_accounts_page(self) -> None:
         content = self._build_subpage_shell("options_accounts", "Accounts")
 
-        add_btn = GlassButton("Add Offline Account", accented=True)
+        btn_bar = QWidget()
+        btn_row = QHBoxLayout(btn_bar)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(8)
+        ely_btn = GlassButton("Add Ely.by Account", accented=True)
+        ely_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        ely_btn.clicked.connect(self._add_ely_account)
+        btn_row.addWidget(ely_btn)
+        add_btn = GlassButton("Add Offline Account")
         add_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
         add_btn.clicked.connect(self._add_offline_account)
+        btn_row.addWidget(add_btn)
+
         content.addWidget(
             _setting_row(
                 "Player Accounts",
-                "Switch active accounts, rename offline players, or remove saved accounts.",
-                control=add_btn,
+                "Sign in with Ely.by or manage offline accounts.",
+                control=btn_bar,
             )
         )
 
@@ -732,7 +989,6 @@ class OptionsPage(QWidget):
         self._accounts_box.setSpacing(10)
         content.addLayout(self._accounts_box)
         content.addStretch(1)
-        self._refresh_accounts_list()
 
     def _refresh_accounts_list(self) -> None:
         while self._accounts_box.count():
@@ -748,7 +1004,8 @@ class OptionsPage(QWidget):
         for account in accounts:
             acc_id = str(account.get("id", ""))
             username = str(account.get("username", "Player"))
-            acc_type = "Ely.by" if account.get("type") == "ely" else "Offline"
+            is_ely = account.get("type") == "ely"
+            acc_type = "Ely.by" if is_ely else "Offline"
             is_active = acc_id == active_id
 
             actions = QWidget()
@@ -766,7 +1023,15 @@ class OptionsPage(QWidget):
                 use_btn.clicked.connect(lambda checked=False, aid=acc_id: self._select_account(aid))
                 row.addWidget(use_btn)
 
-            if account.get("type") == "offline":
+            if is_ely:
+                relogin_btn = GlassButton("Re-login")
+                relogin_btn.setFixedHeight(theme.COMPACT_HEIGHT)
+                hint = str(account.get("email") or username)
+                relogin_btn.clicked.connect(
+                    lambda checked=False, h=hint: self._relogin_ely_account(h)
+                )
+                row.addWidget(relogin_btn)
+            else:
                 rename_btn = GlassButton("Rename")
                 rename_btn.setFixedHeight(theme.COMPACT_HEIGHT)
                 rename_btn.clicked.connect(
@@ -784,6 +1049,51 @@ class OptionsPage(QWidget):
                 _setting_row(username, f"{acc_type} account", control=actions)
             )
 
+    def _add_ely_account(self) -> None:
+        dialog = _ElyLoginDialog(self.runner, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.auth_result:
+            res = dialog.auth_result
+            add_or_update_account(
+                {
+                    "id": res["uuid"],
+                    "type": "ely",
+                    "username": res["username"],
+                    "email": res.get("email", ""),
+                    "uuid": res["uuid"],
+                    "access_token": res["access_token"],
+                    "client_token": res["client_token"],
+                    "user_id": res.get("user_id"),
+                },
+                set_as_active=True,
+            )
+            self._refresh_accounts_list()
+            self.accounts_changed.emit()
+
+    def _relogin_ely_account(self, login_hint: str) -> None:
+        dialog = _ElyLoginDialog(
+            self.runner,
+            login_hint=login_hint,
+            title="Re-login with Ely.by",
+            parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.auth_result:
+            res = dialog.auth_result
+            add_or_update_account(
+                {
+                    "id": res["uuid"],
+                    "type": "ely",
+                    "username": res["username"],
+                    "email": res.get("email", ""),
+                    "uuid": res["uuid"],
+                    "access_token": res["access_token"],
+                    "client_token": res["client_token"],
+                    "user_id": res.get("user_id"),
+                },
+                set_as_active=True,
+            )
+            self._refresh_accounts_list()
+            self.accounts_changed.emit()
+
     def _add_offline_account(self) -> None:
         name, ok = _GlassInputDialog.get_text(self, "Add Offline Account", "Player username:")
         if ok and name:
@@ -792,20 +1102,24 @@ class OptionsPage(QWidget):
                 set_as_active=True,
             )
             self._refresh_accounts_list()
+            self.accounts_changed.emit()
 
     def _select_account(self, account_id: str) -> None:
         set_active_account(account_id)
         self._refresh_accounts_list()
+        self.accounts_changed.emit()
 
     def _rename_offline(self, account_id: str, current: str) -> None:
         name, ok = _GlassInputDialog.get_text(self, "Rename Offline Account", "New username:", text=current)
         if ok and name:
             update_offline_username(account_id, name)
             self._refresh_accounts_list()
+            self.accounts_changed.emit()
 
     def _delete_account(self, account_id: str) -> None:
         remove_account(account_id)
         self._refresh_accounts_list()
+        self.accounts_changed.emit()
 
     # ── Launcher ────────────────────────────────────────────────────────────
     def _build_launcher_page(self) -> None:
@@ -885,15 +1199,47 @@ class OptionsPage(QWidget):
 
         content = self._build_subpage_shell("options_about", "About")
 
-        self._update_status_label = text_label("Check for the latest launcher release.", theme.FONT_BODY, muted=True)
+        self._update_status_label = text_label(
+            self._updater.status_message if self._updater else "Check for the latest launcher release.",
+            theme.FONT_BODY,
+            muted=True,
+        )
+        update_btns = QWidget()
+        update_row = QHBoxLayout(update_btns)
+        update_row.setContentsMargins(0, 0, 0, 0)
+        update_row.setSpacing(8)
+
         self._check_updates_btn = GlassButton("Check for Updates", accented=True)
         self._check_updates_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
         self._check_updates_btn.clicked.connect(self._check_updates)
+        update_row.addWidget(self._check_updates_btn)
+
+        self._notes_btn = GlassButton("What's New")
+        self._notes_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._notes_btn.clicked.connect(self._show_release_notes)
+        update_row.addWidget(self._notes_btn)
+
+        self._view_update_btn = GlassButton("View Update", accented=True)
+        self._view_update_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._view_update_btn.clicked.connect(
+            lambda: self._updater.show_dialog() if self._updater else None
+        )
+        self._view_update_btn.hide()
+        update_row.addWidget(self._view_update_btn)
+
+        self._cancel_update_btn = GlassButton("Cancel Download")
+        self._cancel_update_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._cancel_update_btn.clicked.connect(
+            lambda: self._updater.cancel_download() if self._updater else None
+        )
+        self._cancel_update_btn.hide()
+        update_row.addWidget(self._cancel_update_btn)
+
         content.addWidget(
             _setting_row(
                 f"Wisc Launcher ({launcher_updates.version_label()})",
                 "A clean, fast Minecraft launcher with themed glass surfaces and mod management.",
-                control=self._check_updates_btn,
+                control=update_btns,
                 extra=self._update_status_label,
             )
         )
@@ -928,6 +1274,27 @@ class OptionsPage(QWidget):
             )
         )
 
+        links_widget = QWidget()
+        links_row = QHBoxLayout(links_widget)
+        links_row.setContentsMargins(0, 0, 0, 0)
+        links_row.setSpacing(8)
+        for label, url in (
+            ("GitHub", f"https://github.com/{launcher_updates.REPOSITORY}"),
+            ("Discord", "https://discord.gg/wisc"),
+            ("Support", "https://buymeacoffee.com/jaydeeeep"),
+        ):
+            btn = GlassButton(label)
+            btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+            btn.clicked.connect(lambda checked=False, target=url: QDesktopServices.openUrl(QUrl(target)))
+            links_row.addWidget(btn)
+        content.addWidget(
+            _setting_row(
+                "Community & Links",
+                "Source code, community support, and project links.",
+                control=links_widget,
+            )
+        )
+
         mc_dir = _minecraft_dir()
         open_mc = GlassButton("Open Folder")
         open_mc.setFixedHeight(theme.SEGMENT_HEIGHT)
@@ -950,9 +1317,73 @@ class OptionsPage(QWidget):
                 control=open_data,
             )
         )
+
+        reset_all_btn = GlassButton("Reset All Settings")
+        reset_all_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        reset_all_btn.clicked.connect(self._reset_all_settings)
+        content.addWidget(
+            _setting_row(
+                "Reset Settings",
+                "Restore all launcher settings and preferences to their default values.",
+                control=reset_all_btn,
+            )
+        )
         content.addStretch(1)
+        if self._updater is not None:
+            self._on_updater_state_changed(self._updater.phase, self._updater.status_message)
+
+    def _on_updater_state_changed(self, phase: str, message: str) -> None:
+        if "options_about" not in self._subpages:
+            return
+        self._update_status_label.setText(message)
+        self._check_updates_btn.setEnabled(phase not in ("checking", "downloading", "handing_off"))
+        has_release = self._updater is not None and self._updater.release is not None
+        self._view_update_btn.setVisible(has_release and phase != "checking")
+        self._view_update_btn.setText("Restart Now" if phase == "ready" else "View Update")
+        self._cancel_update_btn.setVisible(phase == "downloading")
+
+    def _show_release_notes(self) -> None:
+        if self._updater is not None:
+            self._updater.show_release_notes()
+            return
+        from wisc.ui.updates import UpdateController
+        controller = UpdateController(
+            self.runner,
+            parent_widget=lambda: self,
+            notify=lambda *_: None,
+            busy=lambda: False,
+            close_window=lambda: None,
+            accent=self._colors["btn_primary"],
+        )
+        controller.show_release_notes()
+
+    def _reset_all_settings(self) -> None:
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self,
+            "Reset All Settings",
+            "Restore all launcher settings to their defaults? Accounts and profiles will be kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._settings = DEFAULT_SETTINGS.copy()
+        save_settings(self._settings)
+        if "options_ui" in self._subpages:
+            self._reset_appearance()
+        if "options_java" in self._subpages:
+            self._sync_java_fields()
+        if "options_game" in self._subpages:
+            self._sync_game_fields()
+        if "options_launcher" in self._subpages:
+            self._sync_launcher_fields()
+        self.settings_changed.emit(dict(self._settings))
 
     def _check_updates(self) -> None:
+        if self._updater is not None:
+            self._updater.check(manual=True)
+            return
         from wisc.services import updates as launcher_updates
 
         self._check_updates_btn.setEnabled(False)

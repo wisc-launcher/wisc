@@ -8,7 +8,7 @@ from typing import Any, Callable
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QButtonGroup, QFrame, QHBoxLayout, QLabel,
+    QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QScrollArea, QVBoxLayout, QWidget,
 )
 
@@ -278,6 +278,52 @@ class SkinsPage(QWidget):
         self.refresh.clicked.connect(self._refresh)
         details_layout.addWidget(self.refresh)
 
+        self._offline_panel = QWidget()
+        offline_layout = QVBoxLayout(self._offline_panel)
+        offline_layout.setContentsMargins(0, 0, 0, 0)
+        offline_layout.setSpacing(10)
+
+        model_row = QHBoxLayout()
+        model_row.setSpacing(8)
+        self._classic_btn = GlassButton("Classic (Steve)")
+        self._classic_btn.setCheckable(True)
+        self._classic_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._classic_btn.clicked.connect(lambda: self._set_offline_model("classic"))
+        self._slim_btn = GlassButton("Slim (Alex)")
+        self._slim_btn.setCheckable(True)
+        self._slim_btn.setFixedHeight(theme.SEGMENT_HEIGHT)
+        self._slim_btn.clicked.connect(lambda: self._set_offline_model("slim"))
+        model_row.addWidget(self._classic_btn, 1)
+        model_row.addWidget(self._slim_btn, 1)
+        offline_layout.addLayout(model_row)
+
+        skin_row = QHBoxLayout()
+        skin_row.setSpacing(8)
+        self._upload_skin_btn = GlassButton("Upload Skin", accented=True)
+        self._upload_skin_btn.setFixedHeight(theme.PRIMARY_BUTTON_HEIGHT)
+        self._upload_skin_btn.clicked.connect(lambda: self._pick_offline_cosmetic("skin"))
+        self._clear_skin_btn = GlassButton("Reset Skin")
+        self._clear_skin_btn.setFixedHeight(theme.PRIMARY_BUTTON_HEIGHT)
+        self._clear_skin_btn.clicked.connect(lambda: self._clear_offline_cosmetic("skin"))
+        skin_row.addWidget(self._upload_skin_btn, 1)
+        skin_row.addWidget(self._clear_skin_btn)
+        offline_layout.addLayout(skin_row)
+
+        cape_row = QHBoxLayout()
+        cape_row.setSpacing(8)
+        self._upload_cape_btn = GlassButton("Upload Cape")
+        self._upload_cape_btn.setFixedHeight(theme.PRIMARY_BUTTON_HEIGHT)
+        self._upload_cape_btn.clicked.connect(lambda: self._pick_offline_cosmetic("cape"))
+        self._clear_cape_btn = GlassButton("Clear Cape")
+        self._clear_cape_btn.setFixedHeight(theme.PRIMARY_BUTTON_HEIGHT)
+        self._clear_cape_btn.clicked.connect(lambda: self._clear_offline_cosmetic("cape"))
+        cape_row.addWidget(self._upload_cape_btn, 1)
+        cape_row.addWidget(self._clear_cape_btn)
+        offline_layout.addLayout(cape_row)
+
+        self._offline_panel.hide()
+        details_layout.addWidget(self._offline_panel)
+
         self.message = text_label("", theme.FONT_DETAIL, muted=True)
         self.message.setWordWrap(True)
         self.message.setMinimumHeight(34)
@@ -319,6 +365,12 @@ class SkinsPage(QWidget):
             button.setEnabled(self._state is not None)
         self.refresh.setEnabled(not busy)
         self.manage.setEnabled(not busy and self._state is not None and not self._state.offline)
+        for btn in (
+            self._classic_btn, self._slim_btn,
+            self._upload_skin_btn, self._clear_skin_btn,
+            self._upload_cape_btn, self._clear_cape_btn,
+        ):
+            btn.setEnabled(not busy and self._state is not None and self._state.offline)
         if not busy:
             self.progress_changed.emit("", False)
 
@@ -382,12 +434,60 @@ class SkinsPage(QWidget):
         else:
             self.avatar.clear()
         self.skin_hint.setText(
-            "Sign in with an Ely.by account to change your skin." if state.offline else
+            "Customize your local offline skin, model, and cape." if state.offline else
             "Change your skin on Ely.by, then refresh here."
         )
-        self.manage.setToolTip("Sign in with an Ely.by account first." if state.offline else
-                               "Open the Ely.by skin manager")
+        self.manage.setVisible(not state.offline)
+        self.refresh.setVisible(not state.offline)
+        self._offline_panel.setVisible(state.offline)
+        if state.offline:
+            model = state.choice.get("model", "classic")
+            self._classic_btn.setChecked(model != "slim")
+            self._slim_btn.setChecked(model == "slim")
+            self._clear_skin_btn.setEnabled(bool(state.choice.get("custom_path")))
+            self._clear_cape_btn.setEnabled(bool(state.choice.get("cape_path")))
+        self.manage.setToolTip("Open the Ely.by skin manager")
         self.preview.set_renderer(state.renderer)
+
+    def _set_offline_model(self, model: str) -> None:
+        if self._state is None or not self._state.offline or self._busy:
+            return
+        account_id = str(self._state.account["id"])
+        from wisc.services import skins
+
+        def op():
+            skins.save_offline_skin_model(account_id, model)
+            return _load_skin_state(self._state.account)
+
+        self._run(op, "Updating character model\u2026", changed=True)
+
+    def _pick_offline_cosmetic(self, kind: str) -> None:
+        if self._state is None or not self._state.offline or self._busy:
+            return
+        title = "Select Skin PNG" if kind == "skin" else "Select Cape PNG"
+        path, _ = QFileDialog.getOpenFileName(self, title, "", "PNG Images (*.png)")
+        if not path:
+            return
+        account_id = str(self._state.account["id"])
+        from wisc.services import skins
+
+        def op():
+            skins.save_offline_cosmetic(account_id, kind, path)
+            return _load_skin_state(self._state.account)
+
+        self._run(op, f"Applying {kind}\u2026", changed=True)
+
+    def _clear_offline_cosmetic(self, kind: str) -> None:
+        if self._state is None or not self._state.offline or self._busy:
+            return
+        account_id = str(self._state.account["id"])
+        from wisc.services import skins
+
+        def op():
+            skins.clear_offline_cosmetic(account_id, kind)
+            return _load_skin_state(self._state.account)
+
+        self._run(op, f"Clearing {kind}\u2026", changed=True)
 
     def _sync(self, force: bool) -> None:
         state = self._state

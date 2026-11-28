@@ -3,7 +3,7 @@
 from functools import lru_cache
 from math import ceil, exp, hypot
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from PyQt6.QtCore import (
     QAbstractAnimation, QEasingCurve, QElapsedTimer, QEvent, QObject, QParallelAnimationGroup,
@@ -11,7 +11,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QIcon, QImageReader, QLinearGradient, QPainter, QPainterPath, QPalette,
-    QPen, QPixmap, QRegion,
+    QPen, QPixmap, QRadialGradient, QRegion,
 )
 from PyQt6.QtWidgets import (
     QAbstractButton, QAbstractItemView, QAbstractScrollArea, QApplication, QComboBox, QFrame, QGraphicsBlurEffect,
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QScrollBar, QSizePolicy, QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget,
 )
 
+from wisc.core.paths import ASSETS_DIR
 from wisc.ui import theme as theme
 from wisc.ui.theme import GLASS_OPACITY, MUTED, SURFACE, TEXT, ui_font
 
@@ -42,7 +43,7 @@ def frosted_image(path: str) -> QPixmap:
     image = artwork_image(path)
     if image.isNull():
         return image
-    image = image.scaledToWidth(min(image.width(), 1200), Qt.TransformationMode.SmoothTransformation)
+    image = image.scaledToWidth(min(image.width(), theme.ARTWORK_BLUR_LIMIT), Qt.TransformationMode.SmoothTransformation)
     scene = QGraphicsScene()
     item = scene.addPixmap(image)
     effect = QGraphicsBlurEffect()
@@ -138,37 +139,71 @@ class ArtworkBackground(QWidget):
         self._artwork_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._artwork_anim.valueChanged.connect(self._on_artwork_step)
         self._home_shading = True
-        self._frame_key: tuple[str, int, int, float, bool] | None = None
+        self._frame_key: tuple[int, int, float, bool] | None = None
         self._frames: dict[bool, QPixmap] = {}
         self._images = images
-        self._last_images: dict[bool, QPixmap] = {}
+        self._displayed_artwork = self._artwork
+        self._artwork_images: dict[bool, QPixmap | None] = {}
+        self._resize_refresh = QTimer(self)
+        self._resize_refresh.setSingleShot(True)
+        self._resize_refresh.setInterval(90)
+        self._resize_refresh.timeout.connect(self._refresh_artwork_images)
         if images is not None:
-            images.ready.connect(self._image_ready)
+            images.ready.connect(self._refresh_artwork_images)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
 
-    def _image_ready(self, key: str) -> None:
-        if key in self._image_keys():
-            self._frames.clear()
-            self.update()
-            for child in self.findChildren(QWidget):
-                if child.isVisible():
-                    child.update()
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._images is not None and self.isVisible():
+            self._resize_refresh.start()
 
-    def _image_sources(self) -> tuple[str, int, str, int, bool]:
-        limit = min(2560, max(480, ceil(max(self.width(), self.height()) * self.devicePixelRatioF() / 128) * 128))
-        return self._artwork, limit, self._softened_artwork or self._artwork, min(limit, 1200), self._softened_artwork is None
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._images is not None and not self._artwork_images:
+            self._refresh_artwork_images()
+
+    def _refresh_artwork_images(self, ready_key: str | None = None) -> None:
+        images = self._images
+        if images is None:
+            return
+        limit = min(2560, max(1920, ceil(max(self.width(), self.height()) * self.devicePixelRatioF() / 256) * 256))
+        blur_limit = min(limit, theme.ARTWORK_BLUR_LIMIT)
+        softened = self._softened_artwork or self._artwork
+        blur = self._softened_artwork is None
+        sharp_key = images.key(self._artwork, limit)
+        soft_key = images.key(softened, blur_limit, blur=blur)
+        if ready_key is not None and ready_key not in (sharp_key, soft_key):
+            return
+        sharp = images.get(self._artwork, limit)
+        soft = images.get(softened, blur_limit, blur=blur)
+        # Swap the cover and its glass rendition together so a slow decode
+        # leaves the existing composition available for painting and resizing.
+        if (sharp is None and not images.has_failed(sharp_key)) or (
+            soft is None and not images.has_failed(soft_key)
+        ):
+            return
+        artwork_images = {
+            False: sharp if sharp is not None else soft,
+            True: soft if soft is not None else sharp,
+        }
+        if self._displayed_artwork != self._artwork:
+            self._displayed_artwork = self._artwork
+            self._start_artwork_fade()
+        elif artwork_images == self._artwork_images:
+            return
+        self._artwork_images = artwork_images
+        self._frames.clear()
+        self.update()
 
     def _find_softened_artwork(self) -> str | None:
         source = Path(self._artwork)
         bundled = source.parent / "blurred" / source.name
         return str(bundled) if bundled.is_file() else None
 
-    def _image_keys(self) -> set[str]:
-        crisp, limit, frosted, blur_limit, blur = self._image_sources()
-        return {self._images.key(crisp, limit), self._images.key(frosted, blur_limit, blur=blur)}
-
     def _on_frost_step(self, value: object) -> None:
         self._frost_progress = float(value)
+        if self._frost_progress >= 1.0:
+            self._frames.pop(False, None)
         self.update()
 
     def set_frosted(self, frosted: bool) -> None:
@@ -195,23 +230,30 @@ class ArtworkBackground(QWidget):
         self.update()
 
     def set_artwork(self, artwork: Path) -> None:
-        if str(artwork) != self._artwork:
-            prev = self._frames.get(self._frosted) or self._frames.get(False)
-            self._artwork = str(artwork)
-            self._softened_artwork = self._find_softened_artwork()
+        source = str(artwork)
+        if source == self._artwork:
+            return
+        self._artwork = source
+        self._softened_artwork = self._find_softened_artwork()
+        if self._images is None:
+            self._start_artwork_fade()
             self._frames.clear()
-            self._last_images.clear()
-            if prev is not None and not prev.isNull():
-                self._artwork_prev_frame = prev
-                self._artwork_anim.stop()
-                self._artwork_progress = 0.0
-                self._artwork_anim.setStartValue(0.0)
-                self._artwork_anim.setEndValue(1.0)
-                self._artwork_anim.start()
-            else:
-                self._artwork_prev_frame = None
-                self._artwork_progress = 1.0
             self.update()
+        else:
+            self._refresh_artwork_images()
+
+    def _start_artwork_fade(self) -> None:
+        prev = self._frames.get(self._frosted) or self._frames.get(False)
+        self._artwork_anim.stop()
+        if prev is None or prev.isNull():
+            self._artwork_prev_frame = None
+            self._artwork_progress = 1.0
+            return
+        self._artwork_prev_frame = prev
+        self._artwork_progress = 0.0
+        self._artwork_anim.setStartValue(0.0)
+        self._artwork_anim.setEndValue(1.0)
+        self._artwork_anim.start()
 
     def _paint_current_artwork(self, painter: QPainter) -> None:
         if self._frost_progress <= 0.0:
@@ -238,14 +280,16 @@ class ArtworkBackground(QWidget):
 
     def paint_artwork(self, painter: QPainter, *, frosted: bool = False) -> None:
         """Reuse one opaque frame per size/DPR for the backdrop and glass controls."""
-        key = (self._artwork, self.width(), self.height(), self.devicePixelRatioF(), self._home_shading)
+        key = (self.width(), self.height(), self.devicePixelRatioF(), self._home_shading)
         if key != self._frame_key:
             self._frame_key = key
             self._frames.clear()
         frame = self._frames.get(frosted)
         if frame is None:
             scale = self.devicePixelRatioF()
-            frame = QPixmap(ceil(self.width() * scale), ceil(self.height() * scale))
+            if frosted:
+                scale = min(scale, theme.ARTWORK_BLUR_LIMIT / max(self.width(), self.height(), 1))
+            frame = QPixmap(max(1, ceil(self.width() * scale)), max(1, ceil(self.height() * scale)))
             frame.setDevicePixelRatio(scale)
             frame.fill(QColor(SURFACE))
             if not frame.isNull():
@@ -254,25 +298,18 @@ class ArtworkBackground(QWidget):
                 self._compose_artwork(composition, frosted=frosted)
                 composition.end()
             self._frames[frosted] = frame
-        painter.drawPixmap(0, 0, frame)
+        if frosted or frame.size() != self.size():
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawPixmap(self.rect(), frame)
 
     def _compose_artwork(self, painter: QPainter, *, frosted: bool) -> None:
         bounds = QRectF(self.rect())
         if self._images is None:
             image = frosted_image(self._artwork) if frosted else artwork_image(self._artwork)
         else:
-            crisp, limit, softened, blur_limit, blur = self._image_sources()
-            image = (self._images.get(softened, blur_limit, blur=blur) if frosted
-                     else self._images.get(crisp, limit))
-            if image is not None:
-                self._last_images[frosted] = image
-            else:
-                image = self._last_images.get(frosted)
-                if image is None and not frosted and Path(self._artwork).is_file():
-                    image = artwork_image(self._artwork)
-                elif image is None:
-                    image = QPixmap()
-        draw_cover(painter, image, bounds)
+            image = self._artwork_images.get(frosted)
+        if image is not None:
+            draw_cover(painter, image, bounds)
         strength = 1.0 if self._home_shading else theme.FEATURE_VIGNETTE_STRENGTH
         horizontal = QLinearGradient(0, 0, self.width(), 0)
         for stop, alpha in theme.VIGNETTE_HORIZONTAL:
@@ -376,15 +413,17 @@ def paint_switch(painter: QPainter, bounds: QRectF, checked: bool, accent: QColo
 
 
 class GlassLineEdit(QLineEdit):
-    def __init__(self, parent: QWidget | None = None, *, search_icon: bool = False):
+    def __init__(self, parent: QWidget | None = None, *, search_icon: bool = False,
+                 opacity: float = GLASS_OPACITY):
         super().__init__(parent)
         self._search_icon = search_icon
+        self._opacity = opacity
         if search_icon:
             self.setTextMargins(26, 0, 0, 0)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        paint_glass(self, painter, radius=theme.RADIUS_FIELD)
+        paint_glass(self, painter, radius=theme.RADIUS_FIELD, opacity=self._opacity)
         if self._search_icon:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.setPen(QPen(QColor(MUTED), theme.STROKE_ICON, Qt.PenStyle.SolidLine,
@@ -539,9 +578,11 @@ class LauncherComboBox(QComboBox):
     """Shared glass selector with content sizing and a field-width popup."""
 
     def __init__(self, parent: QWidget | None = None, *, height: int = 48,
-                 min_width: int = 100, max_width: int = 280, prefix: str = ""):
+                 min_width: int = 100, max_width: int = 280, prefix: str = "",
+                 opacity: float = GLASS_OPACITY):
         super().__init__(parent)
         self._prefix = prefix
+        self._opacity = opacity
         self._popup: _DropdownPopup | None = None
         self._popup_owner: QWidget | None = None
         self.setFixedHeight(height)
@@ -664,7 +705,7 @@ class LauncherComboBox(QComboBox):
         painter = QPainter(self)
         is_open = self._popup is not None and self._popup.isVisible()
         paint_glass(self, painter, radius=theme.RADIUS_FIELD,
-                    opacity=GLASS_OPACITY + (theme.SELECTOR_OPEN_OPACITY if is_open
+                    opacity=self._opacity + (theme.SELECTOR_OPEN_OPACITY if is_open
                                              else theme.SELECTOR_HOVER_OPACITY if self.underMouse() else 0))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         accent = self.window().palette().color(QPalette.ColorRole.Highlight)
@@ -765,7 +806,25 @@ def compose_profile_surface(artwork_path: str, icon_path: str, w: int, h: int, s
     p.fillRect(bounds, shade)
     p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
     if icon is not None:
-        p.drawPixmap(QRectF(14, 14, 28, 28), icon, QRectF(icon.rect()))
+        icon_size = 44
+        icon_x = 16.0
+        icon_y = max(10.0, (h - 60 - icon_size) / 2.0)
+        icon_rect = QRectF(icon_x, icon_y, icon_size, icon_size)
+        shadow_center = QPointF(icon_rect.center().x(), icon_rect.center().y() + 2.0)
+        shadow_radius = icon_size * 0.85
+        shadow_grad = QRadialGradient(shadow_center, shadow_radius)
+        shadow_grad.setColorAt(0.0, QColor(0, 0, 0, 210))
+        shadow_grad.setColorAt(0.58, QColor(0, 0, 0, 135))
+        shadow_grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(shadow_grad)
+        p.drawEllipse(shadow_center, shadow_radius, shadow_radius)
+        icon_clip = QPainterPath()
+        icon_clip.addRoundedRect(icon_rect, theme.RADIUS_FIELD, theme.RADIUS_FIELD)
+        p.save()
+        p.setClipPath(icon_clip)
+        p.drawPixmap(icon_rect, icon, QRectF(icon.rect()))
+        p.restore()
     p.end()
     return surface
 
@@ -822,6 +881,55 @@ def profile_actions_icon(scale: float) -> QIcon:
     return QIcon(pixmap)
 
 
+def resolve_profile_icon_path(icon_value: object) -> Path:
+    """Resolve a stored icon name or path to an existing PNG file."""
+    if isinstance(icon_value, str) and icon_value.strip():
+        candidate = Path(icon_value)
+        if candidate.is_file():
+            return candidate
+        filename = icon_value if icon_value.endswith(".png") else f"{icon_value}.png"
+        for folder in ("icon_blocks", "icon_faces"):
+            named = ASSETS_DIR / "icons" / folder / filename
+            if named.is_file():
+                return named
+    return ASSETS_DIR / "icons" / "icon_blocks" / "grass_block.png"
+
+
+def build_profile_actions_menu(
+    parent: QWidget,
+    *,
+    installed: bool,
+    include_open_home: bool = True,
+    on_action: Callable[[str], None],
+) -> GlassMenu:
+    """Build the shared profile context/action menu."""
+    menu = GlassMenu(parent)
+    menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+    actions: list[tuple[str, str] | None] = []
+    if include_open_home:
+        actions.append(("home", "Open on Home"))
+    actions.extend([
+        ("play", "Play" if installed else "Install && Play"),
+        ("edit", "Edit"),
+        ("folder", "Open Folder"),
+        ("mods", "Mods && Content"),
+        ("duplicate", "Duplicate"),
+        ("repair", "Repair"),
+        None,
+        ("move_up", "Move Up"),
+        ("move_down", "Move Down"),
+        None,
+        ("delete", "Delete"),
+    ])
+    for entry in actions:
+        if entry is None:
+            menu.addSeparator()
+        else:
+            key, label = entry
+            menu.addAction(label, lambda checked=False, action=key: on_action(action))
+    return menu
+
+
 class ProfileCard(QAbstractButton):
     """An artwork card with native button, keyboard, and selection semantics."""
 
@@ -865,6 +973,33 @@ class ProfileCard(QAbstractButton):
 
     def set_accent(self, accent: str) -> None:
         self._accent = accent
+        self.update()
+
+    def set_preview(self, title: str, details: str, icon: Path, artwork: Path | None = None) -> None:
+        """Update card text, icon, and artwork in place for live profile previews."""
+        icon_str = str(icon)
+        icon_changed = icon_str != self._icon
+        artwork_changed = False
+        if artwork is not None:
+            artwork_str = str(artwork)
+            if artwork_str != self._artwork:
+                artwork_changed = True
+                self._artwork = artwork_str
+                source = Path(artwork)
+                bundled = source.parent / "blurred" / source.name
+                self._frosted_artwork = str(bundled) if bundled.is_file() else self._artwork
+        self.title = title
+        self.details = details
+        self._icon = icon_str
+        self.setAccessibleName(title)
+        self.setAccessibleDescription(details)
+        self.setToolTip(f"{title}\n{details}")
+        if icon_changed or artwork_changed:
+            if self._images is not None:
+                self._image_keys = {self._images.key(self._artwork, 480),
+                                    self._images.key(self._frosted_artwork, 480),
+                                    self._images.key(self._icon, 32)}
+            self._surface = None
         self.update()
 
     def hideEvent(self, event) -> None:

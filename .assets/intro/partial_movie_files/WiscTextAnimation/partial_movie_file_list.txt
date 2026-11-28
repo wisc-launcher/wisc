@@ -1,0 +1,3 @@
+# This file records the segment order used by Manim.
+file 'file:F:/Python_Projects/WiscLauncherPyqt/.assets/intro/partial_movie_files/WiscTextAnimation/d19ba8e3caf8e05941626770f21ed9af29286ab47657f58614fb4384ebe5b92e.webm'
+file 'file:F:/Python_Projects/WiscLauncherPyqt/.assets/intro/partial_movie_files/WiscTextAnimation/7ad7f650f930f3bdcdedd2295902973e4966f5ffe740ed67e54a79eef5498209.webm'

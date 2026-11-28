@@ -16,7 +16,6 @@ import requests
 import minecraft_launcher_lib
 from wisc.services import auth as ely_auth
 from wisc.services.profiles import has_pending_pack
-from wisc.mods.manager import ModManager
 from wisc.core.storage import (
 	load_pending_installations,
 	save_pending_installations,
@@ -824,6 +823,92 @@ class InstallationProgressTracker:
 			self.last_eta = ""
 
 
+JVM_OPTIMIZATION_PRESETS: dict[str, tuple[str, ...]] = {
+	"Default": (),
+	"Aikar's Flags (G1GC)": (
+		"-XX:+UseG1GC",
+		"-XX:+ParallelRefProcEnabled",
+		"-XX:MaxGCPauseMillis=200",
+		"-XX:+UnlockExperimentalVMOptions",
+		"-XX:+DisableExplicitGC",
+		"-XX:+AlwaysPreTouch",
+		"-XX:G1NewSizePercent=30",
+		"-XX:G1MaxNewSizePercent=40",
+		"-XX:G1HeapRegionSize=8M",
+		"-XX:G1ReservePercent=20",
+		"-XX:G1HeapWastePercent=5",
+		"-XX:G1MixedGCCountTarget=4",
+		"-XX:InitiatingHeapOccupancyPercent=15",
+		"-XX:G1MixedGCLiveThresholdPercent=90",
+		"-XX:G1RSetUpdatingPauseTimePercent=5",
+		"-XX:SurvivorRatio=32",
+		"-XX:+PerfDisableSharedMem",
+		"-XX:MaxTenuringThreshold=1",
+	),
+	"ZGC (Low Latency)": (
+		"-XX:+UseZGC",
+		"-XX:+ZGenerational",
+		"-XX:+AlwaysPreTouch",
+	),
+	"Shenandoah GC": (
+		"-XX:+UseShenandoahGC",
+		"-XX:+AlwaysPreTouch",
+	),
+}
+
+
+def detect_java_installations(minecraft_dir: str | Path | None = None) -> list[str]:
+	"""Discover Java executables on the system and in Minecraft's managed runtimes."""
+	import shutil
+
+	found: list[str] = []
+	seen: set[str] = set()
+	exe_names = ("javaw.exe", "java.exe") if os.name == "nt" else ("java",)
+
+	def _add(candidate: Path) -> None:
+		try:
+			resolved = str(candidate.resolve())
+		except OSError:
+			resolved = str(candidate)
+		key = resolved.casefold() if os.name == "nt" else resolved
+		if key not in seen and candidate.is_file():
+			seen.add(key)
+			found.append(resolved)
+
+	java_home = os.environ.get("JAVA_HOME", "").strip()
+	if java_home:
+		for name in exe_names:
+			_add(Path(java_home) / "bin" / name)
+
+	which_java = shutil.which("javaw" if os.name == "nt" else "java")
+	if which_java:
+		_add(Path(which_java))
+
+	roots: list[Path] = []
+	if os.name == "nt":
+		for env_var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+			base = os.environ.get(env_var, "").strip()
+			if base:
+				for vendor in ("Java", "Eclipse Adoptium", "Microsoft", "Zulu", "BellSoft", "Semeru"):
+					roots.append(Path(base) / vendor)
+	else:
+		roots.extend((Path("/usr/lib/jvm"), Path("/Library/Java/JavaVirtualMachines")))
+
+	mc_root = Path(minecraft_dir) if minecraft_dir else Path(minecraft_directory)
+	roots.append(mc_root / "runtime")
+
+	for root in roots:
+		if not root.is_dir():
+			continue
+		for name in exe_names:
+			for hit in root.rglob(name):
+				if hit.parent.name.lower() == "bin":
+					_add(hit)
+					if len(found) >= 24:
+						return found
+	return found
+
+
 def get_mod_loader(loader_name: str):
 	return minecraft_launcher_lib.mod_loader.get_mod_loader(loader_name.casefold())
 
@@ -898,6 +983,8 @@ async def start_game(
 	settings=None,
 	cancel_event=None,
 ):
+	from wisc.mods.manager import ModManager
+
 	game_folder = get_profile_game_directory(target)
 	if target.get("is_instance") and not game_folder.is_dir():
 		raise FileNotFoundError(f"Instance folder is missing: {game_folder}. Restore it or select its existing folder before launching.")
@@ -1052,6 +1139,18 @@ async def start_game(
 		)
 		launch_options["jvmArguments"].extend(skin_jvm_args)
 		launch_options["uuid"] = active_uuid
+
+	preset_name = str((settings or {}).get("jvm_preset") or "Default").strip()
+	preset_flags = JVM_OPTIMIZATION_PRESETS.get(preset_name, ())
+	if preset_flags:
+		launch_options["jvmArguments"].extend(preset_flags)
+
+	global_jvm = str((settings or {}).get("jvm_arguments") or "").strip()
+	if global_jvm:
+		try:
+			launch_options["jvmArguments"].extend(shlex.split(global_jvm))
+		except Exception:
+			launch_options["jvmArguments"].extend(global_jvm.split())
 
 	profile_jvm = str((target or {}).get("jvm_arguments") or "").strip()
 	if profile_jvm:

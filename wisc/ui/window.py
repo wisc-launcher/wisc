@@ -286,13 +286,21 @@ class TitleBar(GlassPanel):
         branding.setFixedWidth(200)
         brand = QHBoxLayout(branding)
         brand.setContentsMargins(15, 0, 0, 0)
-        brand.setSpacing(10)
+        brand.setSpacing(8)
         logo = QLabel()
-        logo.setPixmap(artwork_image(str(ASSETS_DIR / "icons" / "wisc_mark.png")).scaled(
-            31, 22, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
+        logo.setContentsMargins(0, 0, 0, 2)
+        logo.setPixmap(artwork_image(str(ASSETS_DIR / "icons" / "wisc_mark.png")).scaledToHeight(
+            22, Qt.TransformationMode.SmoothTransformation,
         ))
         brand.addWidget(logo)
-        brand.addWidget(text_label("Wisc", theme.FONT_PAGE_TITLE, bold=True, pixel=True))
+        title_label = text_label("Wisc", 20, bold=True)
+        title_font = title_label.font()
+        title_font.setFamily("Outfit")
+        title_font.setVariableAxis(title_font.Tag(b"wght"), 600.0)
+        title_font.setLetterSpacing(title_font.SpacingType.PercentageSpacing, 97.5)
+        title_label.setFont(title_font)
+        title_label.setStyleSheet(f"color: {TEXT};")
+        brand.addWidget(title_label)
         brand.addStretch(1)
         row.addWidget(branding)
         row.addStretch(1)
@@ -475,6 +483,8 @@ class FramelessWindow(QMainWindow):
         from wisc.ui.native import NativeWindow
 
         handle = int(self.winId())
+        if self._native is not None and self._native.handle.value == handle and self._native_frame_ready:
+            return
         if self._native is None or self._native.handle.value != handle:
             self._native = NativeWindow(handle)
         self._native_frame_ready = True
@@ -605,6 +615,7 @@ class FramelessWindow(QMainWindow):
                 if not self._state_refresh.isActive():
                     self._state_refresh.start(0)
             elif kind == 0x007D:
+                self._native_frame_ready = False
                 self._frame_setup.start(0)
         # Calling QWidget.nativeEvent here recurses through PyQt's protected virtual wrapper.
         return False, 0
@@ -620,6 +631,7 @@ class FramelessWindow(QMainWindow):
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "_state_refresh"):
             self._state_refresh.start(0)
+            self._native_frame_ready = False
             self._frame_setup.start(0)
 
     def resizeEvent(self, event) -> None:
